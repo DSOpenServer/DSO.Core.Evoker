@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="DSO.Core.Evoker.TestApi\**" />
+    <EmbeddedResource Remove="DSO.Core.Evoker.TestApi\**" />
+    <None Remove="DSO.Core.Evoker.TestApi\**" />
+  </ItemGroup>
+
+</Project>
