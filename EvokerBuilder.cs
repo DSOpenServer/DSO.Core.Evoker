@@ -68,38 +68,83 @@ namespace DSO.Core.Evoker
         }
 
         // --- Delegate Üretimi ve Caching ---
+        // ÖNEMLİ: Cache'lenen delegate artık instance/constructor argümanlarını İÇİNDE BARINDIRMIYOR.
+        // Instance her çağrıda ResolveInstance() ile ayrı üretilip delegate'e PARAMETRE olarak geçiliyor.
+        // Böylece aynı (Type, Method, ReturnType) kombinasyonuna sahip farklı EvokerBuilder
+        // örnekleri (farklı SetInstance/SetConstructor ile) birbirinin sonucunu ezmiyor.
         public Func<object[], TReturn> GetFunc<TReturn>(string methodName, object[]? sampleArgs = null)
         {
-            string cacheKey = $"{_type.FullName}.{methodName}:Func<{typeof(TReturn).Name}>:NonPublic={_includeNonPublic}";
+            string cacheKey = BuildCacheKey(methodName, "Func", typeof(TReturn).Name, sampleArgs);
 
-            return (Func<object[], TReturn>)Cache.GetOrAdd(cacheKey, _ =>
+            var cached = Cache.GetOrAdd(cacheKey, _ => BuildCachedFunc<TReturn>(methodName, sampleArgs));
+            var typedInvoker = (Func<object?, object[], TReturn>)cached.Invoker;
+
+            return args =>
             {
-                var methodInfo = GetMethodInfo(methodName, sampleArgs);
-                var argsParam = Expression.Parameter(typeof(object[]), "args");
-                var body = BuildCallExpression(methodInfo, argsParam);
-
-                Expression finalBody = body;
-                if (methodInfo.ReturnType != typeof(void) && !typeof(TReturn).IsAssignableFrom(methodInfo.ReturnType))
-                {
-                    finalBody = Expression.Convert(body, typeof(TReturn));
-                }
-
-                return Expression.Lambda<Func<object[], TReturn>>(finalBody, argsParam).Compile();
-            });
+                object? instance = cached.IsStatic ? null : ResolveInstance();
+                return typedInvoker(instance, args);
+            };
         }
 
         public Action<object[]> GetAction(string methodName, object[]? sampleArgs = null)
         {
-            string cacheKey = $"{_type.FullName}.{methodName}:Action:NonPublic={_includeNonPublic}";
+            string cacheKey = BuildCacheKey(methodName, "Action", "void", sampleArgs);
 
-            return (Action<object[]>)Cache.GetOrAdd(cacheKey, _ =>
+            var cached = Cache.GetOrAdd(cacheKey, _ => BuildCachedAction(methodName, sampleArgs));
+            var typedInvoker = (Action<object?, object[]>)cached.Invoker;
+
+            return args =>
             {
-                var methodInfo = GetMethodInfo(methodName, sampleArgs);
-                var argsParam = Expression.Parameter(typeof(object[]), "args");
-                var body = BuildCallExpression(methodInfo, argsParam);
+                object? instance = cached.IsStatic ? null : ResolveInstance();
+                typedInvoker(instance, args);
+            };
+        }
 
-                return Expression.Lambda<Action<object[]>>(body, argsParam).Compile();
-            });
+        private string BuildCacheKey(string methodName, string kind, string returnTypeName, object[]? sampleArgs)
+        {
+            // _type.FullName YERİNE AssemblyQualifiedName kullanılıyor:
+            // Reflection.Emit ile üretilen dinamik tipler (bkz. DynamicTypeFactory) aynı isme
+            // ("DynamicCustomer" gibi) sahip ama BAMBAŞKA Type nesneleri olabilir. FullName bu
+            // durumda çakışıp yanlış (önceki tipe ait) delegate'in cache'ten dönmesine sebep olurdu.
+            // AssemblyQualifiedName, dinamik assembly adının içindeki GUID sayesinde tekil kalır.
+            string typeIdentity = _type.AssemblyQualifiedName ?? _type.FullName ?? _type.Name;
+
+            // Argüman TİPLERİ de anahtara dahil ediliyor (sadece sayı değil): aksi halde
+            // Calc(int,int) ve Calc(string,string) gibi aynı isim + aynı parametre sayısına
+            // sahip overload'lar aynı cache key'i paylaşıp birbirinin delegate'ini çalıştırırdı.
+            string argSignature = sampleArgs == null
+                ? "null"
+                : string.Join(",", sampleArgs.Select(a => a?.GetType().Name ?? "null"));
+
+            return $"{typeIdentity}.{methodName}:{kind}<{returnTypeName}>:ArgTypes=({argSignature}):NonPublic={_includeNonPublic}";
+        }
+
+        private CachedMethod BuildCachedFunc<TReturn>(string methodName, object[]? sampleArgs)
+        {
+            var methodInfo = GetMethodInfo(methodName, sampleArgs);
+            var instanceParam = Expression.Parameter(typeof(object), "instance");
+            var argsParam = Expression.Parameter(typeof(object[]), "args");
+            var call = BuildCallExpression(methodInfo, instanceParam, argsParam);
+
+            Expression body = call;
+            if (methodInfo.ReturnType != typeof(void) && !typeof(TReturn).IsAssignableFrom(methodInfo.ReturnType))
+            {
+                body = Expression.Convert(call, typeof(TReturn));
+            }
+
+            var lambda = Expression.Lambda<Func<object?, object[], TReturn>>(body, instanceParam, argsParam);
+            return new CachedMethod(lambda.Compile(), methodInfo.IsStatic);
+        }
+
+        private CachedMethod BuildCachedAction(string methodName, object[]? sampleArgs)
+        {
+            var methodInfo = GetMethodInfo(methodName, sampleArgs);
+            var instanceParam = Expression.Parameter(typeof(object), "instance");
+            var argsParam = Expression.Parameter(typeof(object[]), "args");
+            var call = BuildCallExpression(methodInfo, instanceParam, argsParam);
+
+            var lambda = Expression.Lambda<Action<object?, object[]>>(call, instanceParam, argsParam);
+            return new CachedMethod(lambda.Compile(), methodInfo.IsStatic);
         }
 
         private MethodInfo GetMethodInfo(string methodName, object[]? sampleArgs)
@@ -112,16 +157,60 @@ namespace DSO.Core.Evoker
             if (!methods.Any())
                 throw new MissingMethodException($"[EvokerEngine] '{_type.Name}' üzerinde '{methodName}' metodu bulunamadı.");
 
-            if (sampleArgs != null)
-            {
-                var match = methods.FirstOrDefault(m => m.GetParameters().Length == sampleArgs.Length);
-                if (match != null) return match;
-            }
+            if (sampleArgs == null)
+                return methods.First();
 
-            return methods.First();
+            var candidatesByCount = methods.Where(m => m.GetParameters().Length == sampleArgs.Length).ToList();
+
+            if (candidatesByCount.Count == 0)
+                return methods.First(); // eski davranışla uyumluluk için fallback
+
+            if (candidatesByCount.Count == 1)
+                return candidatesByCount[0];
+
+            // Birden fazla overload aynı parametre sayısına sahipse, argüman tiplerine göre
+            // en uygun eşleşmeyi bulmaya çalışıyoruz (eskiden sadece ilk bulunan seçiliyordu,
+            // bu da overload'lar arasında öngörülemez sonuçlara yol açabiliyordu).
+            var exactMatch = candidatesByCount.FirstOrDefault(m =>
+                MatchesArgTypes(m, sampleArgs, exact: true));
+            if (exactMatch != null) return exactMatch;
+
+            var compatibleMatch = candidatesByCount.FirstOrDefault(m =>
+                MatchesArgTypes(m, sampleArgs, exact: false));
+            if (compatibleMatch != null) return compatibleMatch;
+
+            return candidatesByCount[0];
         }
 
-        private MethodCallExpression BuildCallExpression(MethodInfo methodInfo, ParameterExpression argsParam)
+        private static bool MatchesArgTypes(MethodInfo method, object[] sampleArgs, bool exact)
+        {
+            var parameters = method.GetParameters();
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                var paramType = parameters[i].ParameterType;
+                if (paramType.IsByRef) paramType = paramType.GetElementType()!;
+
+                var arg = sampleArgs[i];
+                if (arg == null)
+                {
+                    if (paramType.IsValueType && Nullable.GetUnderlyingType(paramType) == null)
+                        return false;
+                    continue;
+                }
+
+                if (exact)
+                {
+                    if (paramType != arg.GetType()) return false;
+                }
+                else
+                {
+                    if (!paramType.IsAssignableFrom(arg.GetType())) return false;
+                }
+            }
+            return true;
+        }
+
+        private static MethodCallExpression BuildCallExpression(MethodInfo methodInfo, ParameterExpression instanceParam, ParameterExpression argsParam)
         {
             var parameters = methodInfo.GetParameters();
             var convertedArgs = new Expression[parameters.Length];
@@ -136,33 +225,59 @@ namespace DSO.Core.Evoker
             }
 
             Expression? instance = null;
-
             if (!methodInfo.IsStatic)
             {
-                // 1. Eğer var olan bir instance verildiyse onu Constant olarak kullan
-                if (_existingInstance != null)
-                {
-                    instance = Expression.Constant(_existingInstance, _type);
-                }
-                // 2. Constructor argümanları verildiyse parametreli new çalıştır
-                else if (_constructorArgs != null && _constructorArgs.Length > 0)
-                {
-                    var ctorTypes = _constructorArgs.Select(x => x.GetType()).ToArray();
-                    var ctorConstants = _constructorArgs.Select(x => Expression.Constant(x, x.GetType())).ToArray();
-                    var ctor = _type.GetConstructor(ctorTypes)
-                        ?? throw new MissingMethodException("[EvokerEngine] Uyumlu Constructor bulunamadı.");
-                    instance = Expression.New(ctor, ctorConstants);
-                }
-                // 3. Hiçbiri verilmediyse default new çalıştır
-                else
-                {
-                    instance = Expression.New(_type);
-                }
+                // Instance artık bir Expression.Constant DEĞİL, runtime'da geçilen bir
+                // parametre (instanceParam). Bu sayede derlenmiş delegate her seferinde
+                // aynı nesneyi/tipi kullanmak zorunda kalmıyor.
+                instance = Expression.Convert(instanceParam, methodInfo.DeclaringType!);
             }
 
             return Expression.Call(instance, methodInfo, convertedArgs);
         }
 
-        private static readonly ConcurrentDictionary<string, Delegate> Cache = new();
+        // Instance her ÇAĞRIDA (cache'in dışında) burada çözülüyor:
+        // - SetInstance verilmişse o nesne kullanılır
+        // - SetConstructor verilmişse uygun constructor ile YENİ bir nesne üretilir
+        // - Hiçbiri verilmemişse parametresiz constructor ile YENİ bir nesne üretilir
+        // (Bu, orijinal koddaki "her invoke'ta new instance" davranışını korur.)
+        private object? ResolveInstance()
+        {
+            if (_existingInstance != null)
+                return _existingInstance;
+
+            if (_constructorArgs != null && _constructorArgs.Length > 0)
+            {
+                var ctorTypes = _constructorArgs.Select(x => x.GetType()).ToArray();
+                var ctor = _type.GetConstructor(ctorTypes)
+                    ?? throw new MissingMethodException(
+                        $"[EvokerEngine] '{_type.Name}' için uyumlu constructor bulunamadı (Args: {string.Join(", ", ctorTypes.Select(t => t.Name))}).");
+                return ctor.Invoke(_constructorArgs);
+            }
+
+            try
+            {
+                return Activator.CreateInstance(_type);
+            }
+            catch (MissingMethodException)
+            {
+                throw new MissingMethodException(
+                    $"[EvokerEngine] '{_type.Name}' türünün parametresiz constructor'ı yok. SetInstance() veya SetConstructor() kullanın.");
+            }
+        }
+
+        private sealed class CachedMethod
+        {
+            public readonly Delegate Invoker;
+            public readonly bool IsStatic;
+
+            public CachedMethod(Delegate invoker, bool isStatic)
+            {
+                Invoker = invoker;
+                IsStatic = isStatic;
+            }
+        }
+
+        private static readonly ConcurrentDictionary<string, CachedMethod> Cache = new();
     }
 }

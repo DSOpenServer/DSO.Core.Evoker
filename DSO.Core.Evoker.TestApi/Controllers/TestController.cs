@@ -1,5 +1,6 @@
 ﻿using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using System.Threading.Tasks;
 
 namespace DSO.Core.Evoker.TestApi.Controllers
 {
@@ -55,6 +56,12 @@ namespace DSO.Core.Evoker.TestApi.Controllers
 
             Console.WriteLine($"Dinamik Class Property Değeri: {nameValue}");
             // Çıktı: Dinamik Class Property Değeri: Dokuz Sistem
+        }
+
+        [HttpGet("Test5New")]
+        public async Task Test5New()
+        {
+            await EvokerTests.RunAllAsync();
         }
     }
 }
