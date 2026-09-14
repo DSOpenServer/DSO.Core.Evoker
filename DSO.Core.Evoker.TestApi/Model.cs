@@ -197,4 +197,206 @@ namespace DSO.Core.Evoker.TestApi
             public string Calc(string a, string b) => $"string:{a}{b}";
         }
     }
+
+    public static class PerformanceTests
+    {
+        public static void RunAllAsync()
+        {
+            int failures = 0;
+            void Check(string name, bool condition, string detail = "")
+            {
+                if (condition) Console.WriteLine($"  [OK]   {name}");
+                else { Console.WriteLine($"  [FAIL] {name}  {detail}"); failures++; }
+            }
+
+            var props = new Dictionary<string, Type> { { "Id", typeof(int) }, { "Name", typeof(string) } };
+
+            Console.WriteLine("=== TEST P1: Şema cache - aynı şema AYNI Type'ı döndürmeli ===");
+            {
+                Type t1 = DynamicTypeFactory.CreateType("Customer", props);
+                Type t2 = DynamicTypeFactory.CreateType("Customer", props); // aynı şema, ikinci çağrı
+                Check("Aynı şema aynı Type nesnesini döndürdü (cache çalışıyor)", ReferenceEquals(t1, t2), $"t1={t1.Name}, t2={t2.Name}");
+
+                // Farklı şema (farklı property seti) -> farklı Type olmalı, aynı "Customer" adıyla bile
+                var propsV2 = new Dictionary<string, Type> { { "Id", typeof(int) }, { "Name", typeof(string) }, { "Email", typeof(string) } };
+                Type t3 = DynamicTypeFactory.CreateType("Customer", propsV2);
+                Check("Farklı şema farklı Type üretti (isim çakışmasına rağmen)", !ReferenceEquals(t1, t3));
+            }
+
+            Console.WriteLine("=== TEST P2: CreateUniqueType her seferinde YENİ Type üretmeli ===");
+            {
+                Type u1 = DynamicTypeFactory.CreateUniqueType("Widget", props);
+                Type u2 = DynamicTypeFactory.CreateUniqueType("Widget", props);
+                Check("CreateUniqueType iki farklı Type üretti", !ReferenceEquals(u1, u2));
+            }
+
+            Console.WriteLine("=== TEST P3: DynamicEntityAccessor - constructor + tipe özel getter/setter doğruluğu ===");
+            {
+                Type custType = DynamicTypeFactory.CreateType("Customer", props);
+
+                var ctor = DynamicEntityAccessor.GetConstructor(custType);
+                object instance = ctor();
+
+                var setId = DynamicEntityAccessor.GetSetter<int>(custType, "Id");
+                var setName = DynamicEntityAccessor.GetSetter<string>(custType, "Name");
+                var getId = DynamicEntityAccessor.GetGetter<int>(custType, "Id");
+                var getName = DynamicEntityAccessor.GetGetter<string>(custType, "Name");
+
+                setId(instance, 42);
+                setName(instance, "Dokuz Sistem");
+
+                Check("Id doğru okundu", getId(instance) == 42, $"got={getId(instance)}");
+                Check("Name doğru okundu", getName(instance) == "Dokuz Sistem", $"got={getName(instance)}");
+
+                // İkinci bir instance ile cache'in instance'lar arasında karışmadığını doğrula
+                object instance2 = ctor();
+                setId(instance2, 7);
+                setName(instance2, "İkinci Müşteri");
+                Check("İki farklı instance birbirine karışmadı", getId(instance) == 42 && getId(instance2) == 7,
+                    $"i1.Id={getId(instance)}, i2.Id={getId(instance2)}");
+            }
+
+            Console.WriteLine("=== TEST P4: Warmup - önceden derleme çalışıyor mu ===");
+            {
+                Type orderType = DynamicTypeFactory.CreateType("Order", new Dictionary<string, Type>
+                {
+                    { "Id", typeof(int) }, { "Total", typeof(decimal) }
+                });
+
+                int before = DynamicEntityAccessor.CachedConstructorCount;
+
+                DynamicEntityAccessor.Warmup(new[]
+                {
+                    (orderType, (IEnumerable<(string, Type)>)new[] { ("Id", typeof(int)), ("Total", typeof(decimal)) })
+                });
+
+                int after = DynamicEntityAccessor.CachedConstructorCount;
+                Check("Warmup constructor cache'e ekledi", after > before, $"before={before}, after={after}");
+
+                // Warmup sonrası ilk gerçek kullanım artık "cache miss" olmamalı (fonksiyonel: hata vermeden çalışmalı)
+                var getTotal = DynamicEntityAccessor.GetGetter<decimal>(orderType, "Total");
+                var setTotal = DynamicEntityAccessor.GetSetter<decimal>(orderType, "Total");
+                var ctor = DynamicEntityAccessor.GetConstructor(orderType);
+                var inst = ctor();
+                setTotal(inst, 99.5m);
+                Check("Warmup sonrası accessor doğru çalıştı", getTotal(inst) == 99.5m, $"got={getTotal(inst)}");
+            }
+
+            Console.WriteLine("=== TEST P5: Bounded cache (FIFO tahliye) çalışıyor mu ===");
+            {
+                int oldMax = DynamicEntityAccessor.MaxAccessorCacheSize;
+                try
+                {
+                    DynamicEntityAccessor.MaxAccessorCacheSize = 3;
+
+                    Type t = DynamicTypeFactory.CreateType("BoundedTest", new Dictionary<string, Type>
+                    {
+                        { "A", typeof(int) }, { "B", typeof(int) }, { "C", typeof(int) }, { "D", typeof(int) }, { "E", typeof(int) }
+                    });
+
+                    // 5 farklı property için getter iste -> toplamda cache boyutu sınırı aşacak
+                    DynamicEntityAccessor.GetGetter<int>(t, "A");
+                    DynamicEntityAccessor.GetGetter<int>(t, "B");
+                    DynamicEntityAccessor.GetGetter<int>(t, "C");
+                    DynamicEntityAccessor.GetGetter<int>(t, "D");
+                    DynamicEntityAccessor.GetGetter<int>(t, "E");
+
+                    Check("Accessor cache boyutu sınırı aştı ama en fazla sınır kadar TUTULDU (FIFO tahliye çalıştı)",
+                        DynamicEntityAccessor.CachedAccessorCount <= 3,
+                        $"count={DynamicEntityAccessor.CachedAccessorCount}");
+
+                    // Tahliyeden sonra bile yeniden istenirse yeniden derlenip ÇALIŞMAYA devam etmeli (hata fırlatmamalı)
+                    var getterA = DynamicEntityAccessor.GetGetter<int>(t, "A");
+                    var setterA = DynamicEntityAccessor.GetSetter<int>(t, "A");
+                    var ctor = DynamicEntityAccessor.GetConstructor(t);
+                    var inst = ctor();
+                    setterA(inst, 123);
+                    Check("Tahliye sonrası yeniden istenen accessor doğru çalışıyor", getterA(inst) == 123, $"got={getterA(inst)}");
+                }
+                finally
+                {
+                    DynamicEntityAccessor.MaxAccessorCacheSize = oldMax; // diğer testleri etkilememesi için sınırı geri al
+                }
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("=== BENCHMARK: Eski yöntem (Activator + EvokerBuilder/boxing) vs Yeni yöntem (typed accessor) ===");
+            RunBenchmark();
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM PERFORMANS TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
+        }
+
+        private static void RunBenchmark()
+        {
+            const int N = 200_000;
+
+            var props = new Dictionary<string, Type> { { "Id", typeof(int) }, { "Amount", typeof(decimal) }, { "Name", typeof(string) } };
+            Type benchType = DynamicTypeFactory.CreateType("BenchEntity", props);
+
+            // --- Isınma turu (JIT/derleme maliyetini ölçümün dışında tutmak için) ---
+            {
+                var warm = Activator.CreateInstance(benchType)!;
+                new EvokerBuilder(benchType).SetInstance(warm).Execute("set_Id", 1);
+                var wCtor = DynamicEntityAccessor.GetConstructor(benchType);
+                var wInst = wCtor();
+                DynamicEntityAccessor.GetSetter<int>(benchType, "Id")(wInst, 1);
+                DynamicEntityAccessor.GetSetter<decimal>(benchType, "Amount")(wInst, 1.5m);
+                DynamicEntityAccessor.GetSetter<string>(benchType, "Name")(wInst, "x");
+                _ = DynamicEntityAccessor.GetGetter<int>(benchType, "Id")(wInst);
+            }
+
+            // --- ESKİ YÖNTEM: Activator.CreateInstance + EvokerBuilder (Execute/Invoke, object[]+boxing) ---
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long allocBeforeOld = GC.GetAllocatedBytesForCurrentThread();
+            var swOld = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < N; i++)
+            {
+                object obj = Activator.CreateInstance(benchType)!;
+                var builder = new EvokerBuilder(benchType).SetInstance(obj);
+                builder.Execute("set_Id", i);
+                builder.Execute("set_Amount", 1.5m);
+                builder.Execute("set_Name", "x");
+                int id = builder.Invoke<int>("get_Id");
+                _ = id;
+            }
+            swOld.Stop();
+            long allocAfterOld = GC.GetAllocatedBytesForCurrentThread();
+            long allocOld = allocAfterOld - allocBeforeOld;
+
+            // --- YENİ YÖNTEM: GetConstructor + tipe özel GetGetter/GetSetter (boxing'siz) ---
+            var ctorFast = DynamicEntityAccessor.GetConstructor(benchType);
+            var setId = DynamicEntityAccessor.GetSetter<int>(benchType, "Id");
+            var setAmount = DynamicEntityAccessor.GetSetter<decimal>(benchType, "Amount");
+            var setName = DynamicEntityAccessor.GetSetter<string>(benchType, "Name");
+            var getId = DynamicEntityAccessor.GetGetter<int>(benchType, "Id");
+
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long allocBeforeNew = GC.GetAllocatedBytesForCurrentThread();
+            var swNew = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < N; i++)
+            {
+                object obj = ctorFast();
+                setId(obj, i);
+                setAmount(obj, 1.5m);
+                setName(obj, "x");
+                int id = getId(obj);
+                _ = id;
+            }
+            swNew.Stop();
+            long allocAfterNew = GC.GetAllocatedBytesForCurrentThread();
+            long allocNew = allocAfterNew - allocBeforeNew;
+
+            Console.WriteLine($"  N = {N:N0} satır, her satırda: 1 nesne + 3 set + 1 get");
+            Console.WriteLine($"  ESKİ (Activator+EvokerBuilder) : {swOld.ElapsedMilliseconds,6} ms   |  alloc: {allocOld / 1024.0 / 1024.0,8:F2} MB   |  alloc/satır: {allocOld / (double)N,7:F1} B");
+            Console.WriteLine($"  YENİ (typed accessor)          : {swNew.ElapsedMilliseconds,6} ms   |  alloc: {allocNew / 1024.0 / 1024.0,8:F2} MB   |  alloc/satır: {allocNew / (double)N,7:F1} B");
+
+            if (allocOld > 0)
+            {
+                double speedup = swOld.ElapsedMilliseconds / Math.Max(1.0, swNew.ElapsedMilliseconds);
+                double allocReduction = 100.0 * (1.0 - (double)allocNew / allocOld);
+                Console.WriteLine($"  Hızlanma: ~{speedup:F1}x   |   Alloc azalması: ~%{allocReduction:F0}");
+            }
+        }
+    }
 }

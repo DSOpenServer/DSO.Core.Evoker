@@ -58,10 +58,47 @@ namespace DSO.Core.Evoker.TestApi.Controllers
             // Çıktı: Dinamik Class Property Değeri: Dokuz Sistem
         }
 
-        [HttpGet("Test5New")]
-        public async Task Test5New()
+        [HttpGet("Test4CreateDynamicClassNew")]
+        public void Test4CreateDynamicClassNew()
+        {
+            // 3. Emit ile Runtime'da Class Oluşturma ve Property Set/Get Testi
+            var props = new Dictionary<string, Type>
+            {
+                { "Id", typeof(int) },
+                { "Name", typeof(string) }
+            };
+
+            Type dynamicType = DynamicTypeFactory.CreateType("DynamicCustomer", props);
+            
+            var ctor = DynamicEntityAccessor.GetConstructor(dynamicType);
+            object instance = ctor();
+
+            var setId = DynamicEntityAccessor.GetSetter<int>(dynamicType, "Id");
+            setId(instance, 9);
+
+            var setName = DynamicEntityAccessor.GetSetter<string>(dynamicType, "Name");
+            setName(instance, "Dokuz Sistem");
+
+            var getId = DynamicEntityAccessor.GetGetter<int>(dynamicType, "Id");
+            int idValue = getId(instance);
+
+            var getName = DynamicEntityAccessor.GetGetter<string>(dynamicType, "Name");
+            string nameValue = getName(instance);
+
+            Console.WriteLine($"Dinamik Class Property Değeri: {nameValue} - {idValue}");
+            // Çıktı: Dinamik Class Property Değeri: Dokuz Sistem
+        }
+
+        [HttpGet("Test5AllTest")]
+        public async Task Test5AllTest()
         {
             await EvokerTests.RunAllAsync();
+        }
+
+        [HttpGet("Test6PerformanceTests")]
+        public void Test6PerformanceTests()
+        {
+            PerformanceTests.RunAllAsync();
         }
     }
 }
