@@ -64,15 +64,31 @@ namespace DSO.Core.Evoker
         /// Artık aynı şema aynı Type nesnesini döner. Kesinlikle izole/tekil bir tip
         /// istiyorsanız (ör. çoklu-kiracı izolasyonu, testler) CreateUniqueType() kullanın.
         /// </summary>
-        public static Type CreateType(string className, Dictionary<string, Type> properties)
+        /// <param name="configureType">
+        /// GENİŞLETME NOKTASI (opsiyonel, varsayılan null - mevcut çağrılar hiç etkilenmez).
+        /// Property emisyonu bittikten, ama typeBuilder.CreateType() ile tip "kilitlenmeden"
+        /// HEMEN ÖNCE çağrılır. Interface implementasyonu, base class ayarı gibi ek IL
+        /// işlemleri için (bkz. DSO.Core.Evoker.Extend planı - madde 3/v2) kullanılabilir.
+        /// ÖNEMLİ: configureType verildiğinde şema cache'i BYPASS EDİLİR (CreateUniqueType gibi
+        /// davranır) - çünkü iki farklı configureType çağrısı AYNI (className,properties) ile
+        /// FARKLI tipler üretebilir (biri interface implement eder, diğeri etmez) ve şema cache'i
+        /// sadece property setine baktığı için bu farkı ayırt edemez. Kendi caching stratejinizi
+        /// (ör. configureType'ın kimliğini de içeren bir anahtarla) kendi katmanınızda kurun.
+        /// </param>
+        public static Type CreateType(string className, Dictionary<string, Type> properties, Action<TypeBuilder, IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)>>? configureType = null)
         {
+            if (configureType != null)
+            {
+                return EmitType(className, properties, configureType);
+            }
+
             string signature = BuildSignature(className, properties);
 
             bool added = false;
             Type type = SchemaCache.GetOrAdd(signature, _ =>
             {
                 added = true;
-                return EmitType(className, properties);
+                return EmitType(className, properties, null);
             });
 
             if (added)
@@ -94,9 +110,9 @@ namespace DSO.Core.Evoker
         /// Şema cache'ini BYPASS EDER: her çağrıda kesinlikle yeni, izole bir Type üretir.
         /// Eski CreateType() davranışının karşılığı budur.
         /// </summary>
-        public static Type CreateUniqueType(string className, Dictionary<string, Type> properties)
+        public static Type CreateUniqueType(string className, Dictionary<string, Type> properties, Action<TypeBuilder, IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)>>? configureType = null)
         {
-            return EmitType(className, properties);
+            return EmitType(className, properties, configureType);
         }
 
         /// <summary>
@@ -135,7 +151,7 @@ namespace DSO.Core.Evoker
             return sb.ToString();
         }
 
-        private static Type EmitType(string className, Dictionary<string, Type> properties)
+        private static Type EmitType(string className, Dictionary<string, Type> properties, Action<TypeBuilder, IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)>>? configureType)
         {
             lock (ModuleLock)
             {
@@ -151,19 +167,27 @@ namespace DSO.Core.Evoker
                 string internalName = $"{className}_{id}";
 
                 var typeBuilder = moduleBuilder.DefineType(internalName, TypeAttributes.Public | TypeAttributes.Class);
+                var methodBuildersByProperty = new Dictionary<string, (MethodBuilder Get, MethodBuilder Set)>();
 
                 foreach (var prop in properties)
                 {
                     string propName = prop.Key;
                     Type propType = prop.Value;
 
+                    // NOT (Virtual|NewSlot): metodlar BİLEREK virtual üretiliyor. Sebep: bir
+                    // interface implementasyonu (configureType ile DefineMethodOverride) CLR
+                    // tarafında SADECE virtual metodlarla mümkün ("must be virtual to implement
+                    // a method on an interface" - bunu deneyerek bulduk). Sıradan (interface'siz)
+                    // kullanımda bu HİÇBİR DAVRANIŞ FARKI yaratmaz - çağrılar zaten somut Type
+                    // üzerinden (Expression.Call ile) yapılıyor, virtual dispatch'in ekstra
+                    // maliyeti (bir vtable slotu) ölçülemeyecek kadar küçük.
                     FieldBuilder fieldBuilder = typeBuilder.DefineField($"_{propName.ToLower()}", propType, FieldAttributes.Private);
                     PropertyBuilder propertyBuilder = typeBuilder.DefineProperty(propName, PropertyAttributes.HasDefault, propType, null);
 
                     // Getter: public T get_PropName() => _propName;
                     MethodBuilder getMethodBuilder = typeBuilder.DefineMethod(
                         $"get_{propName}",
-                        MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.HideBySig,
+                        MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.HideBySig | MethodAttributes.Virtual | MethodAttributes.NewSlot,
                         propType,
                         Type.EmptyTypes);
 
@@ -175,7 +199,7 @@ namespace DSO.Core.Evoker
                     // Setter: public void set_PropName(T value) => _propName = value;
                     MethodBuilder setMethodBuilder = typeBuilder.DefineMethod(
                         $"set_{propName}",
-                        MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.HideBySig,
+                        MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.HideBySig | MethodAttributes.Virtual | MethodAttributes.NewSlot,
                         null,
                         new[] { propType });
 
@@ -187,7 +211,18 @@ namespace DSO.Core.Evoker
 
                     propertyBuilder.SetGetMethod(getMethodBuilder);
                     propertyBuilder.SetSetMethod(setMethodBuilder);
+
+                    methodBuildersByProperty[propName] = (getMethodBuilder, setMethodBuilder);
                 }
+
+                // GENİŞLETME NOKTASI: property emisyonu bitti, tip henüz "kilitlenmedi"
+                // (CreateType() çağrılmadı). configureType'a TypeBuilder + zaten ürettiğimiz
+                // get/set MethodBuilder'larını (property adına göre) veriyoruz - çünkü
+                // TypeBuilder.GetMethod() tip CreateType() ile tamamlanmadan ÇALIŞMIYOR
+                // (NotSupportedException), tek yol bu referansları BAŞTAN elden ele geçirmek.
+                // Örn. bir interface property'sini implement etmek için:
+                //   tb.DefineMethodOverride(methodBuilders["Id"].Get, ifaceType.GetMethod("get_Id"));
+                configureType?.Invoke(typeBuilder, methodBuildersByProperty);
 
                 Type createdType = typeBuilder.CreateType()!;
                 SchemaByType[createdType] = properties.Select(p => (p.Key, p.Value)).ToList();

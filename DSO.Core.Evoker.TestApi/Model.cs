@@ -1,5 +1,6 @@
 ﻿using DSO.Core.Evoker;
 using DSO.Core.Evoker.TestApi;
+using System.Reflection.Emit;
 using System.Text;
 
 namespace DSO.Core.Evoker.TestApi
@@ -739,6 +740,101 @@ namespace DSO.Core.Evoker.TestApi
             Console.WriteLine($"  TYPED   (SetValue<int>/GetValue<int>) : {typedAlloc / 1024.0:F1} KB   |  çağrı başı: {typedAlloc / (double)N:F2} B");
             Console.WriteLine($"  UNTYPED (SetValue/GetValue(object))   : {untypedAlloc / 1024.0:F1} KB   |  çağrı başı: {untypedAlloc / (double)N:F2} B");
             Console.WriteLine("  Not: UNTYPED'daki alloc, object'e box'lanan int'lerden geliyor - bu sınırda MATEMATİKSEL OLARAK kaçınılmaz.");
+        }
+    }
+
+    // v2/Extend projesinin bir gün implement edeceği türden, SADECE property içeren bir
+    // interface. Bu test, configureType extension point'inin gerçekten çalıştığını kanıtlıyor -
+    // v2'nin asıl konusu olan "metot gövdeli interface/interceptor" mekanizmasına GİRMİYOR.
+    public interface ITestIdentifiable
+    {
+        int Id { get; set; }
+        string Name { get; set; }
+    }
+
+    public static class ExtensionPointTests
+    {
+        public static void RunAll()
+        {
+            int failures = 0;
+            void Check(string name, bool condition, string detail = "")
+            {
+                if (condition) Console.WriteLine($"  [OK]   {name}");
+                else { Console.WriteLine($"  [FAIL] {name}  {detail}"); failures++; }
+            }
+
+            var props = new Dictionary<string, Type> { { "Id", typeof(int) }, { "Name", typeof(string) } };
+
+            Console.WriteLine("=== TEST E1: Geriye uyumluluk - configureType verilmezse davranış AYNI ===");
+            {
+                Type t1 = DynamicTypeFactory.CreateType("ExtCompatTest", props);
+                Type t2 = DynamicTypeFactory.CreateType("ExtCompatTest", props); // configureType yok -> şema cache çalışmalı
+                Check("configureType olmadan şema cache hâlâ çalışıyor (ReferenceEquals)", ReferenceEquals(t1, t2));
+            }
+
+            Console.WriteLine("=== TEST E2: configureType ile interface implementasyonu ===");
+            {
+                Type t = DynamicTypeFactory.CreateType("ExtInterfaceTest", props, (tb, methodBuilders) =>
+                {
+                    tb.AddInterfaceImplementation(typeof(ITestIdentifiable));
+
+                    // ÖNEMLİ BULGU #1: isim eşleşmesi (get_Id/set_Id) OTOMATİK implementasyon
+                    // sağlamıyor - DefineMethodOverride ile AÇIKÇA bağlamak gerekiyor.
+                    // ÖNEMLİ BULGU #2: TypeBuilder.GetMethod() tip CreateType() ile tamamlanmadan
+                    // ÇALIŞMIYOR - bu yüzden core artık MethodBuilder referanslarını doğrudan
+                    // elden ele geçiriyor (methodBuilders parametresi).
+                    tb.DefineMethodOverride(methodBuilders["Id"].Get, typeof(ITestIdentifiable).GetMethod("get_Id")!);
+                    tb.DefineMethodOverride(methodBuilders["Id"].Set, typeof(ITestIdentifiable).GetMethod("set_Id")!);
+                    tb.DefineMethodOverride(methodBuilders["Name"].Get, typeof(ITestIdentifiable).GetMethod("get_Name")!);
+                    tb.DefineMethodOverride(methodBuilders["Name"].Set, typeof(ITestIdentifiable).GetMethod("set_Name")!);
+                });
+
+                object inst = DynamicEntityAccessor.GetConstructor(t)();
+
+                Check("Üretilen tip ITestIdentifiable implement ediyor", typeof(ITestIdentifiable).IsAssignableFrom(t));
+                Check("Instance ITestIdentifiable'a cast edilebiliyor", inst is ITestIdentifiable);
+
+                // Interface üzerinden DOĞRUDAN eriş (hiç DynamicEntityAccessor kullanmadan!)
+                var typed = (ITestIdentifiable)inst;
+                typed.Id = 42;
+                typed.Name = "Dokuz Sistem";
+
+                Check("Interface üzerinden set edilen Id, interface üzerinden doğru okunuyor", typed.Id == 42, $"got={typed.Id}");
+                Check("Interface üzerinden set edilen Name, interface üzerinden doğru okunuyor", typed.Name == "Dokuz Sistem", $"got={typed.Name}");
+
+                // Çapraz doğrulama: DynamicEntityAccessor (property adıyla) da AYNI backing field'ı görüyor mu?
+                var idViaAccessor = DynamicEntityAccessor.GetGetter<int>(t, "Id")(inst);
+                var nameViaAccessor = DynamicEntityAccessor.GetGetter<string>(t, "Name")(inst);
+                Check("DynamicEntityAccessor ile okunan Id, interface ile set edilenle AYNI", idViaAccessor == 42, $"got={idViaAccessor}");
+                Check("DynamicEntityAccessor ile okunan Name, interface ile set edilenle AYNI", nameViaAccessor == "Dokuz Sistem", $"got={nameViaAccessor}");
+            }
+
+            Console.WriteLine("=== TEST E3: configureType verilince şema cache BYPASS ediliyor mu ===");
+            {
+                Action<TypeBuilder, IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)>> configure = (tb, mb) =>
+                {
+                    tb.AddInterfaceImplementation(typeof(ITestIdentifiable));
+                    tb.DefineMethodOverride(mb["Id"].Get, typeof(ITestIdentifiable).GetMethod("get_Id")!);
+                    tb.DefineMethodOverride(mb["Id"].Set, typeof(ITestIdentifiable).GetMethod("set_Id")!);
+                    tb.DefineMethodOverride(mb["Name"].Get, typeof(ITestIdentifiable).GetMethod("get_Name")!);
+                    tb.DefineMethodOverride(mb["Name"].Set, typeof(ITestIdentifiable).GetMethod("set_Name")!);
+                };
+
+                Type a = DynamicTypeFactory.CreateType("ExtBypassTest", props, configure);
+                Type b = DynamicTypeFactory.CreateType("ExtBypassTest", props, configure);
+
+                Check("configureType ile İKİ ayrı çağrı FARKLI Type üretti (cache bypass doğrulandı)", !ReferenceEquals(a, b));
+                Check("Her ikisi de interface'i implement ediyor", typeof(ITestIdentifiable).IsAssignableFrom(a) && typeof(ITestIdentifiable).IsAssignableFrom(b));
+            }
+
+            Console.WriteLine("=== TEST E4: configureType YOKKEN üretilen tip interface implement ETMİYOR (kirlenme yok) ===");
+            {
+                Type plain = DynamicTypeFactory.CreateType("ExtPlainTest", props); // configureType yok
+                Check("Sıradan CreateType çağrısı interface implement etmiyor", !typeof(ITestIdentifiable).IsAssignableFrom(plain));
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM EXTENSION POINT TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
         }
     }
 }
