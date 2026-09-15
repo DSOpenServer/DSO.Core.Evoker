@@ -25,8 +25,13 @@ namespace DSO.Core.Evoker
     public static class DynamicEntityAccessor
     {
         private static readonly ConcurrentDictionary<Type, Func<object>> ConstructorCache = new();
-        private static readonly ConcurrentDictionary<string, Delegate> AccessorCache = new();
-        private static readonly ConcurrentQueue<string> AccessorInsertionOrder = new();
+
+        // ÖNEMLİ: Key olarak STRING değil, value-tuple kullanılıyor. String interpolation
+        // (ör. $"{type}.{kind}_{prop}:{valueType}") her çağrıda -CACHE HIT olsa bile- yeni bir
+        // string allocate eder; bu da "boxing'siz" dediğimiz yolu sessizce alloc'lu hale getirir.
+        // ValueTuple bir struct olduğu için burada ekstra bir heap allocation OLMAZ.
+        private static readonly ConcurrentDictionary<(Type Type, string Kind, string PropertyName, Type ValueType), Delegate> AccessorCache = new();
+        private static readonly ConcurrentQueue<(Type Type, string Kind, string PropertyName, Type ValueType)> AccessorInsertionOrder = new();
 
         // İsteğe bağlı üst sınır (varsayılan sınırsız). Ad-hoc/şeması sürekli değişen
         // projeksiyonlarla çalışıyorsanız (her sorguda farklı kolon kombinasyonu) makul bir
@@ -51,18 +56,13 @@ namespace DSO.Core.Evoker
         {
             ConstructorCache.TryRemove(type, out _);
 
-            string prefix = (type.AssemblyQualifiedName ?? type.FullName ?? type.Name) + ".";
             foreach (var key in AccessorCache.Keys)
             {
-                if (key.StartsWith(prefix, StringComparison.Ordinal))
+                if (key.Type == type)
                 {
                     AccessorCache.TryRemove(key, out _);
                 }
             }
-            // NOT: AccessorInsertionOrder kuyruğunda bu key'lere ait eski kayıtlar kalabilir;
-            // TrimAccessorCacheIfNeeded onları sırası geldiğinde TryDequeue edip TryRemove
-            // dener, zaten silinmiş olduğu için sessizce no-op olur - zararsız, sadece kuyrukta
-            // geçici "hayalet" kayıt demektir.
         }
 
         /// <summary>
@@ -72,6 +72,11 @@ namespace DSO.Core.Evoker
         /// </summary>
         public static Func<object> GetConstructor(Type type)
         {
+            if (ConstructorCache.TryGetValue(type, out var existing))
+            {
+                return existing;
+            }
+
             return ConstructorCache.GetOrAdd(type, t =>
             {
                 var ctor = t.GetConstructor(Type.EmptyTypes)
@@ -89,8 +94,25 @@ namespace DSO.Core.Evoker
         /// </summary>
         public static Func<object, TValue> GetGetter<TValue>(Type type, string propertyName)
         {
-            string key = BuildKey(type, "get", propertyName, typeof(TValue));
+            var key = (type, "get", propertyName, typeof(TValue));
 
+            // Önce closure/lambda ALLOCATE ETMEDEN dene (cache hit - hot path, %99 durum budur).
+            if (AccessorCache.TryGetValue(key, out var existing))
+            {
+                return (Func<object, TValue>)existing;
+            }
+
+            // Sadece cache MISS olduğunda buraya düşüyoruz. Lambda'yı BİLEREK ayrı bir metoda
+            // taşıdık: aynı metodun içinde yazılı olsaydı, C# derleyicisi capture edilen
+            // 'type'/'propertyName' için closure nesnesini metot girişinde (if'ten ÖNCE)
+            // allocate edebiliyordu - yani "hit path'te de" sessizce alloc oluyordu. Ayrı
+            // metoda taşımak bu riski ortadan kaldırır (empirik olarak doğruladık).
+            return (Func<object, TValue>)CreateAndCacheGetter<TValue>(key, type, propertyName);
+        }
+
+        private static Delegate CreateAndCacheGetter<TValue>(
+            (Type Type, string Kind, string PropertyName, Type ValueType) key, Type type, string propertyName)
+        {
             bool added = false;
             var del = AccessorCache.GetOrAdd(key, _ =>
             {
@@ -104,7 +126,7 @@ namespace DSO.Core.Evoker
                 TrimAccessorCacheIfNeeded();
             }
 
-            return (Func<object, TValue>)del;
+            return del;
         }
 
         /// <summary>
@@ -112,8 +134,19 @@ namespace DSO.Core.Evoker
         /// </summary>
         public static Action<object, TValue> GetSetter<TValue>(Type type, string propertyName)
         {
-            string key = BuildKey(type, "set", propertyName, typeof(TValue));
+            var key = (type, "set", propertyName, typeof(TValue));
 
+            if (AccessorCache.TryGetValue(key, out var existing))
+            {
+                return (Action<object, TValue>)existing;
+            }
+
+            return (Action<object, TValue>)CreateAndCacheSetter<TValue>(key, type, propertyName);
+        }
+
+        private static Delegate CreateAndCacheSetter<TValue>(
+            (Type Type, string Kind, string PropertyName, Type ValueType) key, Type type, string propertyName)
+        {
             bool added = false;
             var del = AccessorCache.GetOrAdd(key, _ =>
             {
@@ -127,7 +160,7 @@ namespace DSO.Core.Evoker
                 TrimAccessorCacheIfNeeded();
             }
 
-            return (Action<object, TValue>)del;
+            return del;
         }
 
         /// <summary>
@@ -163,12 +196,6 @@ namespace DSO.Core.Evoker
             {
                 AccessorCache.TryRemove(oldestKey, out _);
             }
-        }
-
-        private static string BuildKey(Type type, string kind, string propertyName, Type valueType)
-        {
-            string typeIdentity = type.AssemblyQualifiedName ?? type.FullName ?? type.Name;
-            return $"{typeIdentity}.{kind}_{propertyName}:{valueType.Name}";
         }
 
         private static Delegate BuildGetter<TValue>(Type type, string propertyName)

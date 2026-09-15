@@ -28,6 +28,12 @@ namespace DSO.Core.Evoker
         // Şema imzası -> üretilmiş Type. Aynı şema ikinci kez istenirse burada bulunur.
         private static readonly ConcurrentDictionary<string, Type> SchemaCache = new();
 
+        // Type -> o Type'ın property şeması. JSON/serileştirme gibi DIŞARIDAN eklenecek
+        // extension projelerinin (bkz. DSO.Core.Evoker.Json planı) DynamicTypeFactory'nin
+        // ürettiği bir tipin property adı+tipi listesine ERİŞEBİLMESİ için gerekli. Core'un
+        // kendisi bunu JSON/serileştirme için KULLANMAZ - sadece dışarıya açık bir sorgu noktası.
+        private static readonly ConcurrentDictionary<Type, IReadOnlyList<(string Name, Type Type)>> SchemaByType = new();
+
         // İsteğe bağlı: şema cache'i sınırsız büyümesin diye basit bir üst sınır.
         // Varsayılan sınırsız (int.MaxValue) - mevcut davranışla birebir uyumlu.
         // NOT: Bu FIFO (ilk giren ilk çıkar) bir sınırlamadır, GERÇEK bir LRU DEĞİLDİR
@@ -183,8 +189,25 @@ namespace DSO.Core.Evoker
                     propertyBuilder.SetSetMethod(setMethodBuilder);
                 }
 
-                return typeBuilder.CreateType()!;
+                Type createdType = typeBuilder.CreateType()!;
+                SchemaByType[createdType] = properties.Select(p => (p.Key, p.Value)).ToList();
+                return createdType;
             }
         }
+
+        /// <summary>
+        /// Bu Type, DynamicTypeFactory tarafından mı üretildi? (CreateType veya CreateUniqueType ile)
+        /// Örn. bir JsonConverterFactory'nin "bu tipi ben mi ürettim, özel mi davranayım" kararı
+        /// vermesi için kullanılabilir.
+        /// </summary>
+        public static bool IsDynamicType(Type type) => SchemaByType.ContainsKey(type);
+
+        /// <summary>
+        /// Bu Type DynamicTypeFactory tarafından üretildiyse property (ad, tip) listesini döner,
+        /// üretilmediyse null döner. Sıra, AddProperty/Dictionary ile verilme sırasıyla AYNI
+        /// değildir (Dictionary enumeration garantisi yoktur) - isimle eşleştirin, sırayla değil.
+        /// </summary>
+        public static IReadOnlyList<(string Name, Type Type)>? GetSchema(Type type)
+            => SchemaByType.TryGetValue(type, out var schema) ? schema : null;
     }
 }

@@ -532,4 +532,213 @@ namespace DSO.Core.Evoker.TestApi
             return dc;
         }
     }
+
+    public static class NewFeaturesTests
+    {
+        public static void RunAll()
+        {
+            int failures = 0;
+            void Check(string name, bool condition, string detail = "")
+            {
+                if (condition) Console.WriteLine($"  [OK]   {name}");
+                else { Console.WriteLine($"  [FAIL] {name}  {detail}"); failures++; }
+            }
+
+            Console.WriteLine("=== TEST N1: Madde 1 - Şema sorgulama (IsDynamicType / GetSchema) ===");
+            {
+                var dc = DynamicClass.CreateClass("SchemaTest")
+                    .AddProperty<int>("Id")
+                    .AddProperty<string>("Name");
+                dc.SetValue("Id", 1);
+
+                Check("IsDynamicType true döndü", DynamicTypeFactory.IsDynamicType(dc.Type));
+                Check("IsDynamicType normal bir tip için false", !DynamicTypeFactory.IsDynamicType(typeof(string)));
+
+                var schema = DynamicTypeFactory.GetSchema(dc.Type);
+                Check("Schema null değil", schema != null);
+                Check("Schema 2 property içeriyor", schema!.Count == 2, $"count={schema.Count}");
+                Check("Schema Id:int içeriyor", schema.Any(p => p.Name == "Id" && p.Type == typeof(int)));
+                Check("Schema Name:string içeriyor", schema.Any(p => p.Name == "Name" && p.Type == typeof(string)));
+
+                var dcSchema = dc.Schema;
+                Check("DynamicClass.Schema property de aynı sonucu veriyor", dcSchema.Count == 2);
+            }
+
+            Console.WriteLine("=== TEST N2: Madde 2 - OnSet hook (eski/yeni değer) çalışıyor mu ===");
+            {
+                var dc = DynamicClass.CreateClass("HookTest")
+                    .AddProperty<int>("Score");
+
+                int capturedOld = -1, capturedNew = -1;
+                int callCount = 0;
+
+                dc.OnSet<int>("Score", (oldV, newV) =>
+                {
+                    capturedOld = oldV;
+                    capturedNew = newV;
+                    callCount++;
+                });
+
+                dc.SetValue("Score", 10);
+                Check("İlk set'te oldValue=0", capturedOld == 0, $"got={capturedOld}");
+                Check("İlk set'te newValue=10", capturedNew == 10, $"got={capturedNew}");
+
+                dc.SetValue("Score", 25);
+                Check("İkinci set'te oldValue=10 (bir önceki değer)", capturedOld == 10, $"got={capturedOld}");
+                Check("İkinci set'te newValue=25", capturedNew == 25, $"got={capturedNew}");
+                Check("Hook toplam 2 kez çağrıldı", callCount == 2, $"got={callCount}");
+            }
+
+            Console.WriteLine("=== TEST N3: Madde 2 - Hook INSTANCE'A ÖZEL mi ===");
+            {
+                var dcHooked = DynamicClass.CreateClass("SharedHookTest").AddProperty<int>("X");
+                var dcPlain = DynamicClass.CreateClass("SharedHookTest").AddProperty<int>("X");
+
+                Check("İkisi aynı Type'ı paylaşıyor (şema cache doğrulaması)", ReferenceEquals(dcHooked.Type, dcPlain.Type));
+
+                int hookFireCount = 0;
+                dcHooked.OnSet<int>("X", (o, n) => hookFireCount++);
+
+                dcHooked.SetValue("X", 1);
+                dcPlain.SetValue("X", 999);
+
+                Check("Hook'lu instance'ta hook 1 kez çalıştı", hookFireCount == 1, $"got={hookFireCount}");
+                Check("Hook'suz instance etkilenmedi (hookFireCount hâlâ 1)", hookFireCount == 1, $"got={hookFireCount}");
+                Check("Hook'suz instance kendi değerini doğru tutuyor", dcPlain.GetValue<int>("X") == 999);
+            }
+
+            Console.WriteLine("=== TEST N4: Madde 2 - OnGet hook ===");
+            {
+                var dc = DynamicClass.CreateClass("OnGetTest").AddProperty<string>("Name");
+                dc.SetValue("Name", "Dokuz Sistem");
+
+                int readCount = 0;
+                string? lastRead = null;
+                dc.OnGet<string>("Name", v => { readCount++; lastRead = v; });
+
+                var v1 = dc.GetValue<string>("Name");
+                var v2 = dc.GetValue<string>("Name");
+
+                Check("OnGet 2 kez tetiklendi", readCount == 2, $"got={readCount}");
+                Check("OnGet doğru değeri yakaladı", lastRead == "Dokuz Sistem", $"got={lastRead}");
+            }
+
+            Console.WriteLine("=== TEST N5: Madde 4 - Tip bilmeden erişim DOĞRULUK ===");
+            {
+                var dc = DynamicClass.CreateClass("UntypedTest")
+                    .AddProperty<int>("Id")
+                    .AddProperty<string>("Name")
+                    .AddProperty<decimal>("Amount");
+
+                dc.SetValue("Id", (object)42);
+                dc.SetValue("Name", (object)"Dokuz Sistem");
+                dc.SetValue("Amount", (object)99.5m);
+
+                object? idObj = dc.GetValue("Id");
+                object? nameObj = dc.GetValue("Name");
+                object? amountObj = dc.GetValue("Amount");
+
+                Check("Id doğru tipte ve değerde (boxed int)", idObj is int idVal && idVal == 42, $"got={idObj} ({idObj?.GetType()})");
+                Check("Name doğru", nameObj is string s && s == "Dokuz Sistem", $"got={nameObj}");
+                Check("Amount doğru tipte ve değerde (boxed decimal)", amountObj is decimal amt && amt == 99.5m, $"got={amountObj} ({amountObj?.GetType()})");
+
+                Check("Typed GetValue<int> ile de aynı sonuç", dc.GetValue<int>("Id") == 42);
+
+                var dc2 = DynamicClass.CreateClass("OverloadResTest").AddProperty<int>("X");
+                dc2.SetValue("X", 5);
+                Check("SetValue(string,T) çağrısı derleniyor ve çalışıyor (overload çakışması yok)", dc2.GetValue<int>("X") == 5);
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("=== BENCHMARK: Typed SetValue<T>/GetValue<T> (boxing'siz) vs Untyped SetValue/GetValue(object) ===");
+            RunUntypedBenchmark();
+
+            Console.WriteLine();
+            Console.WriteLine("=== EK BENCHMARK: Katman izolasyonu (DynamicEntityAccessor çıplak vs DynamicClass sarmalayıcı) ===");
+            RunLayerIsolationBenchmark();
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM YENİ ÖZELLİK TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
+        }
+
+        private static void RunLayerIsolationBenchmark()
+        {
+            const int N = 200_000;
+            var props = new Dictionary<string, Type> { { "Id", typeof(int) } };
+            Type t = DynamicTypeFactory.CreateType("LayerIsoTest", props);
+            var ctor = DynamicEntityAccessor.GetConstructor(t);
+            object inst = ctor();
+
+            // A) Delegate'i DÖNGÜ DIŞINDA bir kez al, sadece invoke et (teorik taban çizgi)
+            var setId = DynamicEntityAccessor.GetSetter<int>(t, "Id");
+            var getId = DynamicEntityAccessor.GetGetter<int>(t, "Id");
+            setId(inst, 1); getId(inst); // ısınma
+
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long a0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < N; i++) { setId(inst, i); int v = getId(inst); _ = v; }
+            long allocA = GC.GetAllocatedBytesForCurrentThread() - a0;
+
+            // B) Her çağrıda DynamicEntityAccessor.GetSetter/GetGetter'ı YENİDEN iste (DynamicClass'ın yaptığı gibi)
+            DynamicEntityAccessor.GetSetter<int>(t, "Id")(inst, 1); // ısınma (cache dolsun)
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long b0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < N; i++)
+            {
+                DynamicEntityAccessor.GetSetter<int>(t, "Id")(inst, i);
+                int v = DynamicEntityAccessor.GetGetter<int>(t, "Id")(inst);
+                _ = v;
+            }
+            long allocB = GC.GetAllocatedBytesForCurrentThread() - b0;
+
+            // C) DynamicClass üzerinden (gerçek kullanım şekli)
+            var dc = DynamicClass.CreateClass("LayerIsoDC").AddProperty<int>("Id");
+            dc.SetValue("Id", 1); // ısınma
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long c0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < N; i++) { dc.SetValue<int>("Id", i); int v = dc.GetValue<int>("Id"); _ = v; }
+            long allocC = GC.GetAllocatedBytesForCurrentThread() - c0;
+
+            Console.WriteLine($"  A) Delegate önceden alınmış, sadece invoke : {allocA / (double)N,6:F2} B/iterasyon (set+get)");
+            Console.WriteLine($"  B) Her çağrıda GetSetter/GetGetter yeniden isteniyor : {allocB / (double)N,6:F2} B/iterasyon");
+            Console.WriteLine($"  C) DynamicClass.SetValue<T>/GetValue<T> (gerçek API) : {allocC / (double)N,6:F2} B/iterasyon");
+        }
+
+        private static void RunUntypedBenchmark()
+        {
+            const int N = 200_000;
+            var dc = DynamicClass.CreateClass("BenchUntyped").AddProperty<int>("Id");
+            dc.SetValue("Id", 0);
+
+            dc.SetValue("Id", 1);
+            _ = dc.GetValue<int>("Id");
+            dc.SetValue("Id", (object)1);
+            _ = dc.GetValue("Id");
+
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long b1 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < N; i++)
+            {
+                dc.SetValue<int>("Id", i);
+                int v = dc.GetValue<int>("Id");
+                _ = v;
+            }
+            long typedAlloc = GC.GetAllocatedBytesForCurrentThread() - b1;
+
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            long b2 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < N; i++)
+            {
+                dc.SetValue("Id", (object)i);
+                object? v = dc.GetValue("Id");
+                _ = v;
+            }
+            long untypedAlloc = GC.GetAllocatedBytesForCurrentThread() - b2;
+
+            Console.WriteLine($"  N = {N:N0} çağrı (set+get)");
+            Console.WriteLine($"  TYPED   (SetValue<int>/GetValue<int>) : {typedAlloc / 1024.0:F1} KB   |  çağrı başı: {typedAlloc / (double)N:F2} B");
+            Console.WriteLine($"  UNTYPED (SetValue/GetValue(object))   : {untypedAlloc / 1024.0:F1} KB   |  çağrı başı: {untypedAlloc / (double)N:F2} B");
+            Console.WriteLine("  Not: UNTYPED'daki alloc, object'e box'lanan int'lerden geliyor - bu sınırda MATEMATİKSEL OLARAK kaçınılmaz.");
+        }
+    }
 }

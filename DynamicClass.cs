@@ -33,6 +33,13 @@ namespace DSO.Core.Evoker
         private object? _instance;
         private bool _disposed;
 
+        // Madde 2: hook'lar - INSTANCE'A ÖZEL (global DynamicEntityAccessor cache'ine DEĞİL).
+        // Aynı şemadan üretilmiş 1000 DynamicClass'tan sadece birine hook eklemek isteyebilirsiniz;
+        // hook'ları global cache'e koysaydık hepsini etkilerdi. Bedel: hook YOKSA sıfır ek maliyet
+        // (null kontrolü), hook VARSA bir sözlük araması + bir delegate çağrısı daha.
+        private Dictionary<string, Delegate>? _onSetHooks;
+        private Dictionary<string, Delegate>? _onGetHooks;
+
         private DynamicClass(string className, bool useSchemaCache, bool forgetOnDispose)
         {
             if (forgetOnDispose && useSchemaCache)
@@ -82,18 +89,87 @@ namespace DSO.Core.Evoker
         public DynamicClass SetValue<T>(string propertyName, T value)
         {
             EnsureBuilt();
-            DynamicEntityAccessor.GetSetter<T>(_type!, propertyName)(_instance!, value);
+
+            if (_onSetHooks != null && _onSetHooks.TryGetValue(propertyName, out var hookDel) && hookDel is Action<T, T> hook)
+            {
+                T oldValue = DynamicEntityAccessor.GetGetter<T>(_type!, propertyName)(_instance!);
+                DynamicEntityAccessor.GetSetter<T>(_type!, propertyName)(_instance!, value);
+                hook(oldValue, value);
+            }
+            else
+            {
+                DynamicEntityAccessor.GetSetter<T>(_type!, propertyName)(_instance!, value);
+            }
+
             return this; // zincirleme (fluent) çağrılar için
         }
 
         public T GetValue<T>(string propertyName)
         {
             EnsureBuilt();
-            return DynamicEntityAccessor.GetGetter<T>(_type!, propertyName)(_instance!);
+            T value = DynamicEntityAccessor.GetGetter<T>(_type!, propertyName)(_instance!);
+
+            if (_onGetHooks != null && _onGetHooks.TryGetValue(propertyName, out var hookDel) && hookDel is Action<T> hook)
+            {
+                hook(value);
+            }
+
+            return value;
+        }
+
+        /// <summary>
+        /// propertyName set edildiğinde (SetValue&lt;T&gt; ile, T bu kayıttaki T ile TAM eşleşirse)
+        /// callback(eskiDeğer, yeniDeğer) çağrılır. Sadece BU DynamicClass örneğini etkiler.
+        /// Aynı property için tekrar çağırırsanız önceki hook'un yerini alır.
+        /// </summary>
+        public DynamicClass OnSet<T>(string propertyName, Action<T, T> onChanged)
+        {
+            _onSetHooks ??= new Dictionary<string, Delegate>();
+            _onSetHooks[propertyName] = onChanged;
+            return this;
+        }
+
+        /// <summary>
+        /// propertyName okunduğunda (GetValue&lt;T&gt; ile, T bu kayıttaki T ile TAM eşleşirse)
+        /// callback(okunanDeğer) çağrılır. Sadece BU DynamicClass örneğini etkiler.
+        /// </summary>
+        public DynamicClass OnGet<T>(string propertyName, Action<T> onRead)
+        {
+            _onGetHooks ??= new Dictionary<string, Delegate>();
+            _onGetHooks[propertyName] = onRead;
+            return this;
+        }
+
+        public DynamicClass RemoveOnSet(string propertyName) { _onSetHooks?.Remove(propertyName); return this; }
+        public DynamicClass RemoveOnGet(string propertyName) { _onGetHooks?.Remove(propertyName); return this; }
+
+        /// <summary>
+        /// Madde 4: TİP BİLMEDEN erişim. Property'nin derleme-zamanı tipini bilmiyorsanız
+        /// (ör. bir CSV/Excel import motoru, bir property-grid UI) kullanın. DynamicEntityAccessor
+        /// zaten TValue=object ile çağrıldığında Expression.Convert otomatik olarak value type'larda
+        /// box/unbox üretir - bu sınırda boxing MATEMATİKSEL OLARAK KAÇINILMAZDIR (caller'ın elinde
+        /// zaten sadece "object" var). Kazandığımız şey PropertyInfo.GetValue/SetValue'nun getirdiği
+        /// FAZLADAN reflection/validasyon maliyetini atlamak - tek bir box'tan fazlasını ödemiyoruz.
+        /// Tip biliniyorsa SetValue&lt;T&gt;/GetValue&lt;T&gt; kullanın, o yol boxing YAPMAZ.
+        /// </summary>
+        public object? GetValue(string propertyName)
+        {
+            EnsureBuilt();
+            return DynamicEntityAccessor.GetGetter<object>(_type!, propertyName)(_instance!);
+        }
+
+        public DynamicClass SetValue(string propertyName, object? value)
+        {
+            EnsureBuilt();
+            DynamicEntityAccessor.GetSetter<object>(_type!, propertyName)(_instance!, value!);
+            return this;
         }
 
         public Type Type { get { EnsureBuilt(); return _type!; } }
         public object RawInstance { get { EnsureBuilt(); return _instance!; } }
+
+        /// <summary>Property (ad, tip) listesi - JSON/hook-wiring gibi extension projelerin şemayı okuyabilmesi için.</summary>
+        public IReadOnlyList<(string Name, Type Type)> Schema { get { EnsureBuilt(); return DynamicTypeFactory.GetSchema(_type!)!; } }
 
         private void EnsureNotBuilt()
         {

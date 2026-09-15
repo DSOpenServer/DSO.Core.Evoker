@@ -106,5 +106,11 @@ namespace DSO.Core.Evoker.TestApi.Controllers
         {
             DynamicClassTests.RunAll();
         }
+
+        [HttpGet("Test8NewFeaturesTests")]
+        public void Test8NewFeaturesTests()
+        {
+            NewFeaturesTests.RunAll();
+        }
     }
 }
