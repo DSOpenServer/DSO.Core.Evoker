@@ -39,6 +39,33 @@ namespace DSO.Core.Evoker
         public static int CachedAccessorCount => AccessorCache.Count;
 
         /// <summary>
+        /// Belirli bir Type'a ait TÜM cache girdilerini (constructor + o tipin tüm accessor'ları)
+        /// kaldırır. Sadece GERÇEKTEN bir daha kullanılmayacak (tekrar etmeyen şema) tipler için
+        /// çağırın - paylaşımlı/tekrar kullanılan bir tip için çağırırsanız, o tipi kullanan
+        /// BAŞKA kod yolları da bir sonraki çağrılarında yeniden derleme bedelini öder.
+        /// NOT: Type nesnesinin kendisi (CLR metadata'sı) bu çağrıyla bellekten SİLİNMEZ -
+        /// Reflection.Emit ile AssemblyBuilderAccess.Run kullanılarak üretilen tipler
+        /// "collectible" değildir, sadece bizim kendi dictionary cache'imizden çıkarılır.
+        /// </summary>
+        public static void ForgetType(Type type)
+        {
+            ConstructorCache.TryRemove(type, out _);
+
+            string prefix = (type.AssemblyQualifiedName ?? type.FullName ?? type.Name) + ".";
+            foreach (var key in AccessorCache.Keys)
+            {
+                if (key.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    AccessorCache.TryRemove(key, out _);
+                }
+            }
+            // NOT: AccessorInsertionOrder kuyruğunda bu key'lere ait eski kayıtlar kalabilir;
+            // TrimAccessorCacheIfNeeded onları sırası geldiğinde TryDequeue edip TryRemove
+            // dener, zaten silinmiş olduğu için sessizce no-op olur - zararsız, sadece kuyrukta
+            // geçici "hayalet" kayıt demektir.
+        }
+
+        /// <summary>
         /// Parametresiz constructor'ı DERLENMİŞ bir delegate olarak döner. Activator.CreateInstance
         /// her çağrıda reflection üzerinden çözümleme yaptığı için satır-başına nesne yaratmada
         /// belirgin şekilde daha yavaştır; burada derleme maliyeti sadece İLK çağrıda ödenir.

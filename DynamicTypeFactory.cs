@@ -93,6 +93,17 @@ namespace DSO.Core.Evoker
             return EmitType(className, properties);
         }
 
+        /// <summary>
+        /// Belirli bir şemayı şema cache'inden çıkarır (Type nesnesinin kendisini silmez,
+        /// sadece "bu şema tekrar istenirse yeniden üretilsin" der). Nadiren gereken bir
+        /// bakım operasyonu - bkz. DynamicClass.Dispose(forgetOnDispose:true).
+        /// </summary>
+        public static bool ForgetSchema(string className, Dictionary<string, Type> properties)
+        {
+            string signature = BuildSignature(className, properties);
+            return SchemaCache.TryRemove(signature, out _);
+        }
+
         private static void TrimSchemaCacheIfNeeded()
         {
             while (SchemaCache.Count > MaxSchemaCacheSize && SchemaInsertionOrder.TryDequeue(out var oldestKey))

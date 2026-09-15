@@ -100,5 +100,11 @@ namespace DSO.Core.Evoker.TestApi.Controllers
         {
             PerformanceTests.RunAllAsync();
         }
+
+        [HttpGet("Test7DynamicClassTests")]
+        public void Test7DynamicClassTests()
+        {
+            DynamicClassTests.RunAll();
+        }
     }
 }

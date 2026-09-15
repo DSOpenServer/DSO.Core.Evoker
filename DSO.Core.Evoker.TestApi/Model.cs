@@ -399,4 +399,137 @@ namespace DSO.Core.Evoker.TestApi
             }
         }
     }
+
+    public static class DynamicClassTests
+    {
+        public static void RunAll()
+        {
+            int failures = 0;
+            void Check(string name, bool condition, string detail = "")
+            {
+                if (condition) Console.WriteLine($"  [OK]   {name}");
+                else { Console.WriteLine($"  [FAIL] {name}  {detail}"); failures++; }
+            }
+
+            Console.WriteLine("=== TEST D1: Orijinal Test4 örneği - yeni fluent API ile ===");
+            {
+                var yeniClass = DynamicClass.CreateClass("DynamicCustomer")
+                    .AddProperty("Id", typeof(long))
+                    .AddProperty("Name", typeof(string));
+
+                yeniClass.SetValue<long>("Id", 9);
+                yeniClass.SetValue<string>("Name", "Dokuz Sistem");
+
+                var id = yeniClass.GetValue<long>("Id");
+                var name = yeniClass.GetValue<string>("Name");
+
+                Console.WriteLine($"  Id={id}, Name={name}");
+                Check("Id doğru", id == 9, $"got={id}");
+                Check("Name doğru", name == "Dokuz Sistem", $"got={name}");
+            }
+
+            Console.WriteLine("=== TEST D2: Zincirleme (fluent chaining) SetValue ===");
+            {
+                var yeniClass = DynamicClass.CreateClass("ChainTest")
+                    .AddProperty<int>("A")
+                    .AddProperty<int>("B");
+
+                yeniClass.SetValue("A", 1).SetValue("B", 2); // SetValue zincirlenebiliyor mu?
+
+                Check("Zincirleme SetValue çalıştı", yeniClass.GetValue<int>("A") == 1 && yeniClass.GetValue<int>("B") == 2);
+            }
+
+            Console.WriteLine("=== TEST D3: AddProperty ile ilgili YANLIŞ kullanım - Build sonrası AddProperty ENGELLENMELİ ===");
+            {
+                var yeniClass = DynamicClass.CreateClass("LockTest").AddProperty<int>("X");
+                yeniClass.SetValue("X", 1); // artık build edildi
+
+                bool threw = false;
+                try { yeniClass.AddProperty<int>("Y"); }
+                catch (InvalidOperationException) { threw = true; }
+
+                Check("Build sonrası AddProperty InvalidOperationException fırlattı", threw);
+            }
+
+            Console.WriteLine("=== TEST D4: forgetOnDispose + useSchemaCache:true KOMBİNASYONU ENGELLENMELİ ===");
+            {
+                bool threw = false;
+                try { DynamicClass.CreateClass("BadCombo", useSchemaCache: true, forgetOnDispose: true); }
+                catch (ArgumentException) { threw = true; }
+
+                Check("Geçersiz kombinasyon (forgetOnDispose+useSchemaCache) ArgumentException fırlattı", threw);
+            }
+
+            Console.WriteLine("=== TEST D5: Paylaşımlı cache - AYNI şemadan 1000 DynamicClass, accessor cache SADECE 1 KEZ büyümeli ===");
+            {
+                using var warm = MakeSchema("SharedSchema", 0);
+
+                int before = DynamicEntityAccessor.CachedAccessorCount;
+
+                var instances = new List<DynamicClass>();
+                for (int i = 0; i < 1000; i++)
+                {
+                    instances.Add(MakeSchema("SharedSchema", i));
+                }
+
+                int after = DynamicEntityAccessor.CachedAccessorCount;
+
+                Check("1000 aynı-şema örneği accessor cache'i BÜYÜTMEDİ (paylaşım çalışıyor)",
+                    after == before, $"before={before}, after={after}");
+
+                Check("Ama her örnek KENDİ değerini doğru tutuyor (instance karışması yok)",
+                    instances[7].GetValue<int>("Id") == 7 && instances[999].GetValue<int>("Id") == 999);
+
+                foreach (var inst in instances) inst.Dispose();
+            }
+
+            Console.WriteLine("=== TEST D6: İzole (useSchemaCache:false) + forgetOnDispose:true - gerçekten temizliyor mu ===");
+            {
+                int beforeCtor = DynamicEntityAccessor.CachedConstructorCount;
+                int beforeAcc = DynamicEntityAccessor.CachedAccessorCount;
+
+                using (var yeniClass = DynamicClass.CreateClass("Ephemeral", useSchemaCache: false, forgetOnDispose: true))
+                {
+                    yeniClass.AddProperty<int>("Z");
+                    yeniClass.SetValue("Z", 5);
+                    Check("Dispose ÖNCESİ değer doğru okunuyor", yeniClass.GetValue<int>("Z") == 5);
+                }
+
+                int afterCtor = DynamicEntityAccessor.CachedConstructorCount;
+                int afterAcc = DynamicEntityAccessor.CachedAccessorCount;
+
+                Check("Dispose sonrası constructor cache'i geri düştü (temizlendi)",
+                    afterCtor <= beforeCtor, $"before={beforeCtor}, after={afterCtor}");
+                Check("Dispose sonrası accessor cache'i geri düştü (temizlendi)",
+                    afterAcc <= beforeAcc, $"before={beforeAcc}, after={afterAcc}");
+            }
+
+            Console.WriteLine("=== TEST D7: İzole tipler GERÇEKTEN farklı Type nesneleri mi ===");
+            {
+                using var e1 = DynamicClass.CreateClass("IzoleTest", useSchemaCache: false, forgetOnDispose: true);
+                e1.AddProperty<int>("V");
+                e1.SetValue("V", 1);
+
+                using var e2 = DynamicClass.CreateClass("IzoleTest", useSchemaCache: false, forgetOnDispose: true);
+                e2.AddProperty<int>("V");
+                e2.SetValue("V", 2);
+
+                Check("useSchemaCache:false ile her CreateClass FARKLI bir Type üretti", !ReferenceEquals(e1.Type, e2.Type));
+                Check("Her instance kendi değerini koruyor", e1.GetValue<int>("V") == 1 && e2.GetValue<int>("V") == 2);
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM DynamicClass TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
+        }
+
+        private static DynamicClass MakeSchema(string name, int id)
+        {
+            var dc = DynamicClass.CreateClass(name) // useSchemaCache: true (varsayılan)
+                .AddProperty<int>("Id")
+                .AddProperty<string>("Name");
+            dc.SetValue("Id", id);
+            dc.SetValue("Name", $"Item-{id}");
+            return dc;
+        }
+    }
 }
