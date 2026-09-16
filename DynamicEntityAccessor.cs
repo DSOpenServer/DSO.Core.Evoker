@@ -200,7 +200,14 @@ namespace DSO.Core.Evoker
 
         private static Delegate BuildGetter<TValue>(Type type, string propertyName)
         {
-            var property = type.GetProperty(propertyName)
+            // NOT: DeclaredOnly ZORUNLU. DSO.Core.Evoker.Extend ile bir base class'tan türetilen
+            // tiplerde (bkz. Faz 2), bizim ürettiğimiz property (ör. "Name") ile base class'ın
+            // abstract "Name" property'si REFLECTION'DA aynı isimle iki ayrı PropertyInfo olarak
+            // görünür (farklı DeclaringType). DeclaredOnly olmadan GetProperty(name) bu ikisi
+            // arasında karar veremeyip AmbiguousMatchException fırlatır - bunu deneyerek bulduk.
+            // DeclaredOnly, sadece BİZİM emit ettiğimiz (type'ın kendi üzerinde tanımlı) property'yi
+            // hedefler, ki zaten her zaman doğru olan budur.
+            var property = type.GetProperty(propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly)
                 ?? throw new MissingMemberException(type.Name, propertyName);
             var getMethod = property.GetGetMethod()
                 ?? throw new MissingMethodException(
@@ -220,7 +227,7 @@ namespace DSO.Core.Evoker
 
         private static Delegate BuildSetter<TValue>(Type type, string propertyName)
         {
-            var property = type.GetProperty(propertyName)
+            var property = type.GetProperty(propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly)
                 ?? throw new MissingMemberException(type.Name, propertyName);
             var setMethod = property.GetSetMethod()
                 ?? throw new MissingMethodException(

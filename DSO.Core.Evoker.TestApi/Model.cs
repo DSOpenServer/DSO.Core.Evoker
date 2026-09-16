@@ -774,7 +774,7 @@ namespace DSO.Core.Evoker.TestApi
 
             Console.WriteLine("=== TEST E2: configureType ile interface implementasyonu ===");
             {
-                Type t = DynamicTypeFactory.CreateType("ExtInterfaceTest", props, (tb, methodBuilders) =>
+                Type t = DynamicTypeFactory.CreateType("ExtInterfaceTest", props, (tb, members) =>
                 {
                     tb.AddInterfaceImplementation(typeof(ITestIdentifiable));
 
@@ -782,11 +782,11 @@ namespace DSO.Core.Evoker.TestApi
                     // sağlamıyor - DefineMethodOverride ile AÇIKÇA bağlamak gerekiyor.
                     // ÖNEMLİ BULGU #2: TypeBuilder.GetMethod() tip CreateType() ile tamamlanmadan
                     // ÇALIŞMIYOR - bu yüzden core artık MethodBuilder referanslarını doğrudan
-                    // elden ele geçiriyor (methodBuilders parametresi).
-                    tb.DefineMethodOverride(methodBuilders["Id"].Get, typeof(ITestIdentifiable).GetMethod("get_Id")!);
-                    tb.DefineMethodOverride(methodBuilders["Id"].Set, typeof(ITestIdentifiable).GetMethod("set_Id")!);
-                    tb.DefineMethodOverride(methodBuilders["Name"].Get, typeof(ITestIdentifiable).GetMethod("get_Name")!);
-                    tb.DefineMethodOverride(methodBuilders["Name"].Set, typeof(ITestIdentifiable).GetMethod("set_Name")!);
+                    // elden ele geçiriyor (TypeMembers.Properties/Methods parametresi).
+                    tb.DefineMethodOverride(members.Properties["Id"].Get, typeof(ITestIdentifiable).GetMethod("get_Id")!);
+                    tb.DefineMethodOverride(members.Properties["Id"].Set, typeof(ITestIdentifiable).GetMethod("set_Id")!);
+                    tb.DefineMethodOverride(members.Properties["Name"].Get, typeof(ITestIdentifiable).GetMethod("get_Name")!);
+                    tb.DefineMethodOverride(members.Properties["Name"].Set, typeof(ITestIdentifiable).GetMethod("set_Name")!);
                 });
 
                 object inst = DynamicEntityAccessor.GetConstructor(t)();
@@ -811,13 +811,13 @@ namespace DSO.Core.Evoker.TestApi
 
             Console.WriteLine("=== TEST E3: configureType verilince şema cache BYPASS ediliyor mu ===");
             {
-                Action<TypeBuilder, IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)>> configure = (tb, mb) =>
+                Action<TypeBuilder, DynamicTypeFactory.TypeMembers> configure = (tb, members) =>
                 {
                     tb.AddInterfaceImplementation(typeof(ITestIdentifiable));
-                    tb.DefineMethodOverride(mb["Id"].Get, typeof(ITestIdentifiable).GetMethod("get_Id")!);
-                    tb.DefineMethodOverride(mb["Id"].Set, typeof(ITestIdentifiable).GetMethod("set_Id")!);
-                    tb.DefineMethodOverride(mb["Name"].Get, typeof(ITestIdentifiable).GetMethod("get_Name")!);
-                    tb.DefineMethodOverride(mb["Name"].Set, typeof(ITestIdentifiable).GetMethod("set_Name")!);
+                    tb.DefineMethodOverride(members.Properties["Id"].Get, typeof(ITestIdentifiable).GetMethod("get_Id")!);
+                    tb.DefineMethodOverride(members.Properties["Id"].Set, typeof(ITestIdentifiable).GetMethod("set_Id")!);
+                    tb.DefineMethodOverride(members.Properties["Name"].Get, typeof(ITestIdentifiable).GetMethod("get_Name")!);
+                    tb.DefineMethodOverride(members.Properties["Name"].Set, typeof(ITestIdentifiable).GetMethod("set_Name")!);
                 };
 
                 Type a = DynamicTypeFactory.CreateType("ExtBypassTest", props, configure);
