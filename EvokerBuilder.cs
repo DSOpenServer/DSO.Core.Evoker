@@ -218,7 +218,23 @@ namespace DSO.Core.Evoker
             for (int i = 0; i < parameters.Length; i++)
             {
                 var paramType = parameters[i].ParameterType;
-                if (paramType.IsByRef) paramType = paramType.GetElementType()!;
+
+                if (paramType.IsByRef)
+                {
+                    // ÖNEMLİ (bulundu, önceden sessizce yanlıştı): burada eskiden paramType'ı
+                    // byref'sizleştirip Expression.Convert ile devam ediyorduk. Bu DERLENİYORDU
+                    // ve ÇALIŞIYORDU (hata fırlatmıyordu) ama LINQ Expression derleyicisi byref
+                    // argümanı için görünmez bir GEÇİCİ DEĞİŞKEN oluşturup çağrıyı onun üzerinden
+                    // yapıyor, sonra o geçici değişkeni SESSİZCE ATIYORDU - yani `out`/`ref` ile
+                    // dönen değer çağırana ASLA ulaşmıyordu. Artık açıkça reddediyoruz.
+                    throw new NotSupportedException(
+                        $"[EvokerBuilder] '{methodInfo.Name}' metodunun '{parameters[i].Name}' parametresi " +
+                        "ref/out. EvokerBuilder'ın object[] tabanlı çağrı sözleşmesi ref/out DEĞERLERİNİ " +
+                        "ÇAĞIRANA GERİ TAŞIYAMAZ (önceden sessizce kaybediyordu, şimdi açıkça reddediyoruz). " +
+                        "Bunun yerine düz reflection kullanın: " +
+                        "'type.GetMethod(name).Invoke(instance, args)' - bu, args dizisindeki out/ref " +
+                        "slotlarını doğru şekilde günceller.");
+                }
 
                 var arrayAccess = Expression.ArrayIndex(argsParam, Expression.Constant(i));
                 convertedArgs[i] = Expression.Convert(arrayAccess, paramType);

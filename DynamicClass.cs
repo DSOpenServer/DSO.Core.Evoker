@@ -27,6 +27,7 @@ namespace DSO.Core.Evoker
         private readonly string _className;
         private readonly Dictionary<string, Type> _properties = new();
         private readonly Dictionary<string, Type> _methods = new(); // metot adı -> delegate tipi
+        private readonly Dictionary<string, MethodInfo> _genericMethods = new(); // metot adı -> template MethodInfo (generic imzayı tanımlar)
         private readonly bool _useSchemaCache;
         private readonly bool _forgetOnDispose;
 
@@ -85,18 +86,50 @@ namespace DSO.Core.Evoker
         /// çağırırsanız InvalidOperationException alırsınız (sessiz NullReferenceException değil).
         /// </summary>
         public DynamicClass AddMethod<TDelegate>(string methodName) where TDelegate : Delegate
+            => AddMethod(methodName, typeof(TDelegate));
+
+        /// <summary>
+        /// AddMethod'un non-generic hali. Delegate tipi COMPILE-TIME'da bilinmediğinde
+        /// (ör. Extend'in `ref`/`out` içeren bir interface metodu için RUNTIME'DA sentezlediği
+        /// bir delegate tipi) kullanılır.
+        /// </summary>
+        public DynamicClass AddMethod(string methodName, Type delegateType)
         {
             EnsureNotBuilt();
 
-            if (_methods.TryGetValue(methodName, out var existingType) && existingType != typeof(TDelegate))
+            if (!typeof(Delegate).IsAssignableFrom(delegateType))
+            {
+                throw new ArgumentException($"[DynamicClass] '{delegateType.Name}' bir delegate tipi değil.", nameof(delegateType));
+            }
+
+            if (_methods.TryGetValue(methodName, out var existingType) && existingType != delegateType)
             {
                 throw new InvalidOperationException(
                     $"[DynamicClass] '{methodName}' metodu zaten '{existingType.Name}' imzasıyla eklenmiş, " +
-                    $"'{typeof(TDelegate).Name}' ile TEKRAR eklenemez.");
+                    $"'{delegateType.Name}' ile TEKRAR eklenemez.");
             }
 
-            _methods[methodName] = typeof(TDelegate);
+            _methods[methodName] = delegateType;
             return this;
+        }
+
+        /// <summary>
+        /// AddMethod ile eklenen bir metodun BEKLEDİĞİ delegate tipini döner. `ref`/`out`
+        /// parametreli metotlarda bu tip Func&lt;...&gt;/Action&lt;...&gt; DEĞİL, runtime'da
+        /// üretilmiş özel bir delegate tipidir (bkz. DynamicDelegateTypeFactory) - bir lambda ile
+        /// doğrudan yazamazsınız, gerçek bir metodu Delegate.CreateDelegate ile bağlamanız gerekir:
+        /// <code>
+        /// var del = Delegate.CreateDelegate(dc.GetMethodDelegateType("TryParse"), null, gerçekMetot);
+        /// dc.SetMethod("TryParse", del);
+        /// </code>
+        /// </summary>
+        public Type GetMethodDelegateType(string methodName)
+        {
+            if (!_methods.TryGetValue(methodName, out var delegateType))
+            {
+                throw new MissingMemberException($"[DynamicClass] '{methodName}' AddMethod ile eklenmemiş.");
+            }
+            return delegateType;
         }
 
         /// <summary>
@@ -105,12 +138,61 @@ namespace DSO.Core.Evoker
         /// önce çağrılırsa build'i tetikler.
         /// </summary>
         public DynamicClass SetMethod<TDelegate>(string methodName, TDelegate implementation) where TDelegate : Delegate
+            => SetMethod(methodName, (Delegate)implementation);
+
+        /// <summary>
+        /// SetMethod'un non-generic hali. `ref`/`out` parametreli metotlar için gereklidir -
+        /// böyle bir metodun delegate tipi runtime'da sentezlendiğinden, bir C# lambda'sını
+        /// doğrudan TDelegate'e bağlayamazsınız (bkz. GetMethodDelegateType).
+        /// </summary>
+        public DynamicClass SetMethod(string methodName, Delegate implementation)
         {
             EnsureBuilt();
 
             FieldInfo field = _type!.GetField($"_method_{methodName}", BindingFlags.NonPublic | BindingFlags.Instance)
                 ?? throw new MissingMemberException(
-                    $"[DynamicClass] '{methodName}' için metot alanı bulunamadı. AddMethod<{typeof(TDelegate).Name}>(\"{methodName}\") ile eklediniz mi?");
+                    $"[DynamicClass] '{methodName}' için metot alanı bulunamadı. AddMethod(\"{methodName}\", ...) ile eklediniz mi?");
+
+            if (!field.FieldType.IsInstanceOfType(implementation))
+            {
+                throw new ArgumentException(
+                    $"[DynamicClass] '{methodName}' için verilen delegate tipi ('{implementation.GetType().Name}') " +
+                    $"beklenen tiple ('{field.FieldType.Name}') uyuşmuyor.", nameof(implementation));
+            }
+
+            field.SetValue(_instance, implementation);
+            return this;
+        }
+
+        /// <summary>
+        /// FAZ 3b: Şemaya GENERİC bir metot ekler (ör. `T Get&lt;T&gt;()`). templateMethod,
+        /// kopyalanacak generic imzayı (generic parametreler + onları kullanan parametre/dönüş
+        /// tipleri) tanımlayan bir MethodInfo'dur - tipik olarak Extend'in bir interface/base
+        /// class'tan otomatik türettiği metot. Standalone (interface'siz) kullanım için kendi
+        /// MethodInfo'nuzu (ör. bir örnek/template sınıftaki generic bir metot) verebilirsiniz.
+        /// </summary>
+        public DynamicClass AddGenericMethod(MethodInfo templateMethod)
+        {
+            EnsureNotBuilt();
+            _genericMethods[templateMethod.Name] = templateMethod;
+            return this;
+        }
+
+        /// <summary>
+        /// AddGenericMethod ile eklenmiş generic bir metoda implementasyon atar. Çağrı
+        /// sözleşmesi TYPE-ERASURE'dır: implementation, metot HANGİ T ile çağrılırsa çağrılsın
+        /// aynı delegate'tir - generic tip argümanları (typeArgs[0], typeArgs[1], ...) ve
+        /// argüman değerleri (args[0], args[1], ...) size PARAMETRE olarak gelir, siz de
+        /// sonucu object olarak (value type'sa BOX'layarak) döndürürsünüz. Bu, tek bir
+        /// delegate field'ının HER ÇAĞRIDA farklı T ile çalışabilmesinin TEK yoludur.
+        /// </summary>
+        public DynamicClass SetGenericMethod(string methodName, Func<Type[], object?[], object?> implementation)
+        {
+            EnsureBuilt();
+
+            FieldInfo field = _type!.GetField($"_genericmethod_{methodName}", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new MissingMemberException(
+                    $"[DynamicClass] '{methodName}' için generic metot alanı bulunamadı. AddGenericMethod(...) ile eklediniz mi?");
 
             field.SetValue(_instance, implementation);
             return this;
@@ -241,8 +323,8 @@ namespace DSO.Core.Evoker
             if (_type != null) return;
 
             _type = _useSchemaCache
-                ? DynamicTypeFactory.CreateType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null)
-                : DynamicTypeFactory.CreateUniqueType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null);
+                ? DynamicTypeFactory.CreateType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null, _genericMethods.Count > 0 ? _genericMethods : null)
+                : DynamicTypeFactory.CreateUniqueType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null, _genericMethods.Count > 0 ? _genericMethods : null);
             _instance = DynamicEntityAccessor.GetConstructor(_type)();
         }
 

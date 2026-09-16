@@ -57,12 +57,23 @@ namespace DSO.Core.Evoker
             public IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)> Properties { get; }
             public IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> Methods { get; }
 
+            /// <summary>
+            /// FAZ 3b: generic metotlar (ör. `T Get&lt;T&gt;()`). Normal Methods'tan AYRI tutulur
+            /// çünkü çağrı sözleşmesi farklıdır - burada delegate field'ı her zaman
+            /// Func&lt;Type[], object?[], object?&gt;'dir (type-erasure), Func&lt;bool&gt; gibi
+            /// somut bir tip DEĞİLDİR (bir generic metot, açık tip parametreleri içerdiği için
+            /// tek bir somut delegate tipiyle ifade edilemez - her çağrı farklı T ile yapılabilir).
+            /// </summary>
+            public IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> GenericMethods { get; }
+
             public TypeMembers(
                 IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)> properties,
-                IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> methods)
+                IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> methods,
+                IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> genericMethods)
             {
                 Properties = properties;
                 Methods = methods;
+                GenericMethods = genericMethods;
             }
         }
 
@@ -105,20 +116,21 @@ namespace DSO.Core.Evoker
             string className,
             Dictionary<string, Type> properties,
             Action<TypeBuilder, TypeMembers>? configureType = null,
-            Dictionary<string, Type>? methods = null)
+            Dictionary<string, Type>? methods = null,
+            Dictionary<string, MethodInfo>? genericMethods = null)
         {
             if (configureType != null)
             {
-                return EmitType(className, properties, configureType, methods);
+                return EmitType(className, properties, configureType, methods, genericMethods);
             }
 
-            string signature = BuildSignature(className, properties, methods);
+            string signature = BuildSignature(className, properties, methods, genericMethods);
 
             bool added = false;
             Type type = SchemaCache.GetOrAdd(signature, _ =>
             {
                 added = true;
-                return EmitType(className, properties, null, methods);
+                return EmitType(className, properties, null, methods, genericMethods);
             });
 
             if (added)
@@ -138,9 +150,10 @@ namespace DSO.Core.Evoker
             string className,
             Dictionary<string, Type> properties,
             Action<TypeBuilder, TypeMembers>? configureType = null,
-            Dictionary<string, Type>? methods = null)
+            Dictionary<string, Type>? methods = null,
+            Dictionary<string, MethodInfo>? genericMethods = null)
         {
-            return EmitType(className, properties, configureType, methods);
+            return EmitType(className, properties, configureType, methods, genericMethods);
         }
 
         /// <summary>
@@ -161,7 +174,7 @@ namespace DSO.Core.Evoker
             }
         }
 
-        private static string BuildSignature(string className, Dictionary<string, Type> properties, Dictionary<string, Type>? methods)
+        private static string BuildSignature(string className, Dictionary<string, Type> properties, Dictionary<string, Type>? methods, Dictionary<string, MethodInfo>? genericMethods = null)
         {
             // Dictionary'nin enumeration sırası garanti değildir; aynı şema farklı sırayla
             // verildiğinde cache miss oluşmaması için isimlere göre sıralıyoruz.
@@ -183,6 +196,15 @@ namespace DSO.Core.Evoker
                 }
             }
 
+            if (genericMethods != null && genericMethods.Count > 0)
+            {
+                sb.Append("||G");
+                foreach (var kvp in genericMethods.OrderBy(m => m.Key, StringComparer.Ordinal))
+                {
+                    sb.Append('|').Append(kvp.Key).Append(':').Append(kvp.Value.DeclaringType?.AssemblyQualifiedName).Append('.').Append(kvp.Value.ToString());
+                }
+            }
+
             return sb.ToString();
         }
 
@@ -190,7 +212,8 @@ namespace DSO.Core.Evoker
             string className,
             Dictionary<string, Type> properties,
             Action<TypeBuilder, TypeMembers>? configureType,
-            Dictionary<string, Type>? methods)
+            Dictionary<string, Type>? methods,
+            Dictionary<string, MethodInfo>? genericMethods = null)
         {
             lock (ModuleLock)
             {
@@ -203,6 +226,7 @@ namespace DSO.Core.Evoker
                 var typeBuilder = moduleBuilder.DefineType(internalName, TypeAttributes.Public | TypeAttributes.Class);
                 var propertyAccessors = new Dictionary<string, (MethodBuilder Get, MethodBuilder Set)>();
                 var methodForwarders = new Dictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)>();
+                var genericMethodForwarders = new Dictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)>();
 
                 foreach (var prop in properties)
                 {
@@ -252,14 +276,175 @@ namespace DSO.Core.Evoker
                     }
                 }
 
+                if (genericMethods != null)
+                {
+                    foreach (var m in genericMethods)
+                    {
+                        genericMethodForwarders[m.Key] = EmitGenericMethodForwarder(typeBuilder, m.Value);
+                    }
+                }
+
                 // GENİŞLETME NOKTASI: emisyon bitti, tip henüz "kilitlenmedi". configureType'a
                 // TypeBuilder + zaten ürettiğimiz property/metot bilgilerini veriyoruz.
-                configureType?.Invoke(typeBuilder, new TypeMembers(propertyAccessors, methodForwarders));
+                configureType?.Invoke(typeBuilder, new TypeMembers(propertyAccessors, methodForwarders, genericMethodForwarders));
 
                 Type createdType = typeBuilder.CreateType()!;
                 SchemaByType[createdType] = properties.Select(p => (p.Key, p.Value)).ToList();
                 return createdType;
             }
+        }
+
+        /// <summary>
+        /// FAZ 3b: generic bir metot (ör. `T Get&lt;T&gt;()`, `TResult Map&lt;T,TResult&gt;(T input)`)
+        /// için forwarder üretir. templateMethod, kopyalanacak generic imzayı (generic parametre
+        /// sayısı/adları + onları kullanan parametre/dönüş tipleri) TANIMLAYAN bir MethodInfo'dur
+        /// (tipik olarak implement edilen interface'in veya extend edilen base class'ın metodu).
+        ///
+        /// ÇAĞRI SÖZLEŞMESİ (type-erasure): delegate her zaman
+        /// Func&lt;Type[] genericTypeArgs, object?[] args, object? result&gt; şeklindedir.
+        /// Bu, generic metotlarda KAÇINILMAZ bir mimari gerçek: bir delegate FIELD'ının tipi
+        /// sabittir, ama bir generic metot HER ÇAĞRIDA farklı T ile çağrılabilir - tek bir somut
+        /// Func&lt;T,...&gt; bunu ifade edemez. Value-type T'ler için bu, GetValue(string)'teki
+        /// gibi kaçınılmaz bir boxing/unboxing getirir.
+        ///
+        /// KISIT: templateMethod hem generic HEM ref/out parametreli olamaz (iki karmaşıklığın
+        /// kesişimi bu sürümde desteklenmiyor) - böyle bir metot NotSupportedException alır.
+        /// </summary>
+        private static (FieldBuilder DelegateField, MethodBuilder Method) EmitGenericMethodForwarder(
+            TypeBuilder typeBuilder, MethodInfo templateMethod)
+        {
+            Type[] templateGenericParams = templateMethod.GetGenericArguments();
+            ParameterInfo[] templateParams = templateMethod.GetParameters();
+
+            if (templateParams.Any(p => p.ParameterType.IsByRef))
+            {
+                throw new NotSupportedException(
+                    $"[DynamicTypeFactory] '{templateMethod.Name}' hem generic HEM ref/out parametreli - " +
+                    "bu kombinasyon desteklenmiyor.");
+            }
+
+            Type delegateFieldType = typeof(Func<Type[], object?[], object?>);
+            FieldBuilder fieldBuilder = typeBuilder.DefineField($"_genericmethod_{templateMethod.Name}", delegateFieldType, FieldAttributes.Private);
+
+            MethodBuilder methodBuilder = typeBuilder.DefineMethod(
+                templateMethod.Name,
+                MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.Virtual | MethodAttributes.NewSlot);
+
+            GenericTypeParameterBuilder[] newGenericParams = templateGenericParams.Length > 0
+                ? methodBuilder.DefineGenericParameters(templateGenericParams.Select(t => t.Name).ToArray())
+                : Array.Empty<GenericTypeParameterBuilder>();
+
+            Type SubstituteType(Type type)
+            {
+                int idx = Array.IndexOf(templateGenericParams, type);
+                if (idx >= 0) return newGenericParams[idx];
+
+                if (type.IsGenericType && !type.IsGenericTypeDefinition)
+                {
+                    var args = type.GetGenericArguments().Select(SubstituteType).ToArray();
+                    return type.GetGenericTypeDefinition().MakeGenericType(args);
+                }
+
+                if (type.IsArray)
+                {
+                    var elem = SubstituteType(type.GetElementType()!);
+                    return type.GetArrayRank() == 1 ? elem.MakeArrayType() : elem.MakeArrayType(type.GetArrayRank());
+                }
+
+                return type; // template'in generic parametrelerine bağlı olmayan sıradan bir tip
+            }
+
+            Type returnType = SubstituteType(templateMethod.ReturnType);
+            Type[] paramTypes = templateParams.Select(p => SubstituteType(p.ParameterType)).ToArray();
+
+            methodBuilder.SetSignature(returnType, null, null, paramTypes.Length > 0 ? paramTypes : null, null, null);
+            for (int i = 0; i < templateParams.Length; i++)
+            {
+                methodBuilder.DefineParameter(i + 1, ParameterAttributes.None, templateParams[i].Name);
+            }
+
+            ILGenerator il = methodBuilder.GetILGenerator();
+
+            // ÖNEMLİ BULGU: generic parametreli bir metodun IL'inde doğrudan bir dallanma+throw
+            // (branch to a label that ends in Newobj+Throw) kullanmak bu runtime'da
+            // InvalidProgramException'a yol açıyor - deneyerek bulduk (aynı desen, generic
+            // OLMAYAN forwarder'da sorunsuz çalışıyor). Çözüm: null kontrolünü IL'İN İÇİNE
+            // gömmek yerine normal (Reflection.Emit'siz) bir C# yardımcı metoduna (aşağıdaki
+            // InvokeGenericMethodDelegate) taşıdık - JIT onu sorunsuz derliyor, generic
+            // forwarder'ın IL'i ise HİÇ dallanmadan düz bir çizgi (her zaman yardımcıyı çağırır,
+            // o null ise KENDİSİ throw eder).
+            LocalBuilder typeArgsLocal = il.DeclareLocal(typeof(Type[]));
+            il.Emit(OpCodes.Ldc_I4, newGenericParams.Length);
+            il.Emit(OpCodes.Newarr, typeof(Type));
+            for (int i = 0; i < newGenericParams.Length; i++)
+            {
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4, i);
+                il.Emit(OpCodes.Ldtoken, newGenericParams[i]);
+                il.Emit(OpCodes.Call, typeof(Type).GetMethod(nameof(Type.GetTypeFromHandle))!);
+                il.Emit(OpCodes.Stelem_Ref);
+            }
+            il.Emit(OpCodes.Stloc, typeArgsLocal);
+
+            // object?[] args = { p1, p2, ... }  (value type'lar BOX'lanır)
+            LocalBuilder argsLocal = il.DeclareLocal(typeof(object[]));
+            il.Emit(OpCodes.Ldc_I4, paramTypes.Length);
+            il.Emit(OpCodes.Newarr, typeof(object));
+            for (int i = 0; i < paramTypes.Length; i++)
+            {
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4, i);
+                il.Emit(OpCodes.Ldarg_S, (byte)(i + 1));
+                if (paramTypes[i].IsValueType || paramTypes[i].IsGenericParameter)
+                {
+                    // paramTypes[i] bir generic parametre OLABİLİR (T) - Box IL'i generic
+                    // parametreler için de geçerlidir, JIT runtime'da gerçek tipe göre karar verir.
+                    il.Emit(OpCodes.Box, paramTypes[i]);
+                }
+                il.Emit(OpCodes.Stelem_Ref);
+            }
+            il.Emit(OpCodes.Stloc, argsLocal);
+
+            // InvokeGenericMethodDelegate(delegateField, metotAdı, typeArgs, args) - null
+            // kontrolü ve throw BURADA (normal C#'ta), IL'de DEĞİL.
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldfld, fieldBuilder);
+            il.Emit(OpCodes.Ldstr, templateMethod.Name);
+            il.Emit(OpCodes.Ldloc, typeArgsLocal);
+            il.Emit(OpCodes.Ldloc, argsLocal);
+            il.Emit(OpCodes.Call, typeof(DynamicTypeFactory).GetMethod(nameof(InvokeGenericMethodDelegate))!);
+
+            if (returnType == typeof(void))
+            {
+                il.Emit(OpCodes.Pop);
+            }
+            else
+            {
+                // Unbox_Any hem value type hem reference type dönüş tipleri için ÇALIŞIR
+                // (reference type'ta güvenli bir cast'e eşdeğerdir) - tek IL'de ikisini de kapsar.
+                il.Emit(OpCodes.Unbox_Any, returnType);
+            }
+            il.Emit(OpCodes.Ret);
+
+            return (fieldBuilder, methodBuilder);
+        }
+
+        /// <summary>
+        /// Generic metot forwarder'larının IL'den ÇAĞIRDIĞI yardımcı - null kontrolü ve throw
+        /// burada, normal C#'ta yapılıyor (IL içine gömülü bir branch+throw, generic metotlarda
+        /// bu runtime'da InvalidProgramException'a yol açıyordu - deneyerek bulduk).
+        /// </summary>
+        public static object? InvokeGenericMethodDelegate(
+            Func<Type[], object?[], object?>? implementation, string methodName, Type[] typeArgs, object?[] args)
+        {
+            if (implementation == null)
+            {
+                throw new InvalidOperationException(
+                    $"[DynamicClass] '{methodName}' (generic) metodu için implementasyon atanmamış. " +
+                    $"SetGenericMethod(\"{methodName}\", ...) ile bir delegate atayın.");
+            }
+
+            return implementation(typeArgs, args);
         }
 
         /// <summary>
