@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Threading.Tasks;
@@ -21,23 +23,37 @@ namespace DSO.Core.Evoker
     /// Şemanız GERÇEKTEN bir kerelik/tekrar etmeyecekse (ör. her çağrıda rastgele farklı kolon
     /// seti), useSchemaCache:false + forgetOnDispose:true verin ve using/Dispose ile temizleyin -
     /// aksi halde cache sessizce, sınırsız büyür.
+    ///
+    /// THREAD-SAFETY: Şema tanımlama metotları (AddProperty/AddMethod/AddGenericMethod/
+    /// WithTypeConfigurator) ve build (EnsureBuilt) bir `_buildLock` ile korunuyor - aynı
+    /// DynamicClass'ı birden fazla thread'den EŞ ZAMANLI kurmaya çalışsanız bile Type/instance
+    /// SADECE BİR KEZ üretilir. OnSet/OnGet hook'ları build SONRASINDA bile eklenebildiği ve
+    /// SetValue/GetValue'nun (hot path) her çağrısında okunduğu için ConcurrentDictionary
+    /// kullanılıyor - kaba bir kilit yerine, hot path'i yavaşlatmayan ince-taneli senkronizasyon.
+    /// SetValue/GetValue'nun KENDİSİ (aynı property'ye eşzamanlı yazma) senkronize DEĞİLDİR -
+    /// bu, herhangi bir paylaşımlı mutable nesneyle aynı, normal .NET semantiğidir; eşzamanlı
+    /// yazma güvenliği gerekiyorsa çağıran taraf kendi senkronizasyonunu eklemelidir.
     /// </summary>
     public sealed class DynamicClass : IDisposable
     {
+        private readonly object _buildLock = new();
         private readonly string _className;
         private readonly Dictionary<string, Type> _properties = new();
         private readonly Dictionary<string, Type> _methods = new(); // metot adı -> delegate tipi
         private readonly Dictionary<string, MethodInfo> _genericMethods = new(); // metot adı -> template MethodInfo (generic imzayı tanımlar)
+        private readonly Dictionary<string, Type> _events = new(); // event adı -> handler delegate tipi
         private readonly bool _useSchemaCache;
         private readonly bool _forgetOnDispose;
 
-        private Type? _type;
+        private volatile Type? _type;
         private object? _instance;
         private bool _disposed;
 
-        // Hook'lar - INSTANCE'A ÖZEL (global DynamicEntityAccessor cache'ine DEĞİL).
-        private Dictionary<string, Delegate>? _onSetHooks;
-        private Dictionary<string, Delegate>? _onGetHooks;
+        // Hook'lar - INSTANCE'A ÖZEL (global DynamicEntityAccessor cache'ine DEĞİL). Build
+        // sonrasında bile eklenip SetValue/GetValue'nun hot path'inden okunduğu için
+        // ConcurrentDictionary - global bir kilit yerine ince-taneli senkronizasyon.
+        private ConcurrentDictionary<string, Delegate>? _onSetHooks;
+        private ConcurrentDictionary<string, Delegate>? _onGetHooks;
 
         // DSO.Core.Evoker.Extend için GENİŞLETME NOKTASI - core bunu HİÇ KULLANMAZ.
         private Action<TypeBuilder, DynamicTypeFactory.TypeMembers>? _configureType;
@@ -61,20 +77,52 @@ namespace DSO.Core.Evoker
         public static DynamicClass CreateClass(string? className = null, bool useSchemaCache = true, bool forgetOnDispose = false)
             => new DynamicClass(className ?? $"Dynamic_{Guid.NewGuid():N}", useSchemaCache, forgetOnDispose);
 
-        public DynamicClass AddProperty(string name, Type type)
+        /// <summary>
+        /// VAR OLAN bir DynamicTypeFactory tipini ve o tipten bir instance'ı DynamicClass API'sine
+        /// sarmalar. AddProperty/AddMethod/build akışını hiç ATLAR - tip zaten üretilmiş, instance
+        /// zaten var. Tipik kullanım: bir deserialize işleminden (ör. DSO.Core.Evoker.Json) veya
+        /// başka bir kod yolundan elinize geçen "çıplak" bir dynamic-type instance'ını, SetValue/
+        /// GetValue/InvokeMethod gibi rahat API'lerle kullanmak istediğinizde.
+        /// </summary>
+        public static DynamicClass Wrap(Type type, object instance)
         {
-            EnsureNotBuilt();
-
-            if (_properties.TryGetValue(name, out var existingType) && existingType != type)
+            if (!DynamicTypeFactory.IsDynamicType(type))
             {
-                throw new InvalidOperationException(
-                    $"[DynamicClass] '{name}' property'si zaten '{existingType.Name}' tipiyle eklenmiş, " +
-                    $"'{type.Name}' ile TEKRAR eklenemez. Aynı isimle farklı tipte iki AddProperty çağrısı " +
-                    "büyük olasılıkla bir hata işaretidir.");
+                throw new ArgumentException(
+                    $"[DynamicClass] '{type.Name}' DynamicTypeFactory tarafından üretilmemiş, Wrap() ile sarmalanamaz.",
+                    nameof(type));
             }
 
-            _properties[name] = type;
-            return this;
+            if (!type.IsInstanceOfType(instance))
+            {
+                throw new ArgumentException(
+                    $"[DynamicClass] Verilen instance '{type.Name}' tipinde değil (gerçek tip: '{instance.GetType().Name}').",
+                    nameof(instance));
+            }
+
+            var dc = new DynamicClass(type.Name, useSchemaCache: true, forgetOnDispose: false);
+            dc._type = type;       // _type != null olduğu için EnsureBuilt() bir daha build ETMEZ
+            dc._instance = instance;
+            return dc;
+        }
+
+        public DynamicClass AddProperty(string name, Type type)
+        {
+            lock (_buildLock)
+            {
+                EnsureNotBuilt();
+
+                if (_properties.TryGetValue(name, out var existingType) && existingType != type)
+                {
+                    throw new InvalidOperationException(
+                        $"[DynamicClass] '{name}' property'si zaten '{existingType.Name}' tipiyle eklenmiş, " +
+                        $"'{type.Name}' ile TEKRAR eklenemez. Aynı isimle farklı tipte iki AddProperty çağrısı " +
+                        "büyük olasılıkla bir hata işaretidir.");
+                }
+
+                _properties[name] = type;
+                return this;
+            }
         }
 
         public DynamicClass AddProperty<T>(string name) => AddProperty(name, typeof(T));
@@ -95,22 +143,25 @@ namespace DSO.Core.Evoker
         /// </summary>
         public DynamicClass AddMethod(string methodName, Type delegateType)
         {
-            EnsureNotBuilt();
-
-            if (!typeof(Delegate).IsAssignableFrom(delegateType))
+            lock (_buildLock)
             {
-                throw new ArgumentException($"[DynamicClass] '{delegateType.Name}' bir delegate tipi değil.", nameof(delegateType));
-            }
+                EnsureNotBuilt();
 
-            if (_methods.TryGetValue(methodName, out var existingType) && existingType != delegateType)
-            {
-                throw new InvalidOperationException(
-                    $"[DynamicClass] '{methodName}' metodu zaten '{existingType.Name}' imzasıyla eklenmiş, " +
-                    $"'{delegateType.Name}' ile TEKRAR eklenemez.");
-            }
+                if (!typeof(Delegate).IsAssignableFrom(delegateType))
+                {
+                    throw new ArgumentException($"[DynamicClass] '{delegateType.Name}' bir delegate tipi değil.", nameof(delegateType));
+                }
 
-            _methods[methodName] = delegateType;
-            return this;
+                if (_methods.TryGetValue(methodName, out var existingType) && existingType != delegateType)
+                {
+                    throw new InvalidOperationException(
+                        $"[DynamicClass] '{methodName}' metodu zaten '{existingType.Name}' imzasıyla eklenmiş, " +
+                        $"'{delegateType.Name}' ile TEKRAR eklenemez.");
+                }
+
+                _methods[methodName] = delegateType;
+                return this;
+            }
         }
 
         /// <summary>
@@ -173,9 +224,12 @@ namespace DSO.Core.Evoker
         /// </summary>
         public DynamicClass AddGenericMethod(MethodInfo templateMethod)
         {
-            EnsureNotBuilt();
-            _genericMethods[templateMethod.Name] = templateMethod;
-            return this;
+            lock (_buildLock)
+            {
+                EnsureNotBuilt();
+                _genericMethods[templateMethod.Name] = templateMethod;
+                return this;
+            }
         }
 
         /// <summary>
@@ -185,6 +239,14 @@ namespace DSO.Core.Evoker
         /// argüman değerleri (args[0], args[1], ...) size PARAMETRE olarak gelir, siz de
         /// sonucu object olarak (value type'sa BOX'layarak) döndürürsünüz. Bu, tek bir
         /// delegate field'ının HER ÇAĞRIDA farklı T ile çalışabilmesinin TEK yoludur.
+        ///
+        /// `ref`/`out` PARAMETRELER: args[i] normal bir değer DEĞİL, TEK ELEMANLI bir "holder"
+        /// (object?[1]) olur - ((object?[])args[i])[0] üzerinden okuyup/yazarsınız. ÖNEMLİ
+        /// SÖZLEŞME: T bir value type olabileceği için holder[0]'a ASLA çıplak null koymayın
+        /// (forwarder onu Unbox_Any ile açar, null verirseniz NullReferenceException alırsınız) -
+        /// "değer yok" durumunda bile typeArgs[i]'nin geçerli bir boxlanmış varsayılan değerini
+        /// koyun (value type için Activator.CreateInstance(typeArgs[i]), reference type için
+        /// null güvenlidir).
         /// </summary>
         public DynamicClass SetGenericMethod(string methodName, Func<Type[], object?[], object?> implementation)
         {
@@ -195,6 +257,60 @@ namespace DSO.Core.Evoker
                     $"[DynamicClass] '{methodName}' için generic metot alanı bulunamadı. AddGenericMethod(...) ile eklediniz mi?");
 
             field.SetValue(_instance, implementation);
+            return this;
+        }
+
+        /// <summary>
+        /// FAZ 4c: Şemaya gerçek bir CLR EVENT'i ekler (ör. `event EventHandler Changed;`).
+        /// THandler tipik olarak EventHandler/EventHandler&lt;T&gt; veya kendi delegate'inizdir.
+        /// Üretilen event, standart C# add/remove semantiğine sahiptir (Delegate.Combine/Remove) -
+        /// dc.As&lt;TInterface&gt;().Changed += handler; gibi NORMAL C# event syntax'ıyla
+        /// abone olunabilir/çıkılabilir.
+        /// </summary>
+        public DynamicClass AddEvent<THandler>(string eventName) where THandler : Delegate
+            => AddEvent(eventName, typeof(THandler));
+
+        /// <summary>AddEvent'in non-generic hali (handler tipi runtime'da bilindiğinde).</summary>
+        public DynamicClass AddEvent(string eventName, Type handlerType)
+        {
+            lock (_buildLock)
+            {
+                EnsureNotBuilt();
+
+                if (!typeof(Delegate).IsAssignableFrom(handlerType))
+                {
+                    throw new ArgumentException($"[DynamicClass] '{handlerType.Name}' bir delegate tipi değil.", nameof(handlerType));
+                }
+
+                if (_events.TryGetValue(eventName, out var existingType) && existingType != handlerType)
+                {
+                    throw new InvalidOperationException(
+                        $"[DynamicClass] '{eventName}' event'i zaten '{existingType.Name}' tipiyle eklenmiş, " +
+                        $"'{handlerType.Name}' ile TEKRAR eklenemez.");
+                }
+
+                _events[eventName] = handlerType;
+                return this;
+            }
+        }
+
+        /// <summary>
+        /// Event'i İÇERİDEN (ör. bir SetMethod delegate'i içinden, ya da bir property değiştiğinde)
+        /// tetiklemek için. Event'e hiç abone olunmadıysa (backing field null) sessizce hiçbir şey
+        /// yapmaz - normal C# event semantiğiyle tutarlı ("kimse dinlemiyorsa tetiklemenin bir
+        /// zararı yok").
+        /// </summary>
+        public DynamicClass RaiseEvent(string eventName, params object?[] args)
+        {
+            EnsureBuilt();
+
+            FieldInfo field = _type!.GetField($"_event_{eventName}", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new MissingMemberException(
+                    $"[DynamicClass] '{eventName}' için event alanı bulunamadı. AddEvent(...) ile eklediniz mi?");
+
+            var handler = field.GetValue(_instance) as Delegate;
+            handler?.DynamicInvoke(args);
+
             return this;
         }
 
@@ -225,22 +341,146 @@ namespace DSO.Core.Evoker
 
         public DynamicClass WithTypeConfigurator(Action<TypeBuilder, DynamicTypeFactory.TypeMembers> configurator)
         {
-            EnsureNotBuilt();
-            if (_configureType == null)
+            lock (_buildLock)
             {
-                _configureType = configurator;
+                EnsureNotBuilt();
+                if (_configureType == null)
+                {
+                    _configureType = configurator;
+                }
+                else
+                {
+                    var previous = _configureType;
+                    _configureType = (tb, members) => { previous(tb, members); configurator(tb, members); };
+                }
+                return this;
             }
-            else
+        }
+
+        // FAZ 4: Attribute enjeksiyonu (ör. [Obsolete], [Required] veya kendi custom attribute'unuz).
+        private readonly List<CustomAttributeBuilder> _typeAttributes = new();
+        private readonly Dictionary<string, List<CustomAttributeBuilder>> _propertyAttributes = new();
+        private bool _attributeConfiguratorRegistered;
+
+        /// <summary>Üretilen TİPİN kendisine bir attribute ekler (ör. [Serializable]).</summary>
+        public DynamicClass AddTypeAttribute<TAttribute>(params object[] constructorArgs) where TAttribute : Attribute
+        {
+            lock (_buildLock)
             {
-                var previous = _configureType;
-                _configureType = (tb, members) => { previous(tb, members); configurator(tb, members); };
+                EnsureNotBuilt();
+                var ctor = ResolveAttributeConstructor(typeof(TAttribute), constructorArgs);
+                _typeAttributes.Add(new CustomAttributeBuilder(ctor, constructorArgs));
+                RegisterAttributeConfiguratorIfNeeded();
+                return this;
             }
-            return this;
+        }
+
+        /// <summary>Belirli bir PROPERTY'e bir attribute ekler (ör. [JsonPropertyName("id")]).</summary>
+        public DynamicClass AddPropertyAttribute<TAttribute>(string propertyName, params object[] constructorArgs) where TAttribute : Attribute
+        {
+            lock (_buildLock)
+            {
+                EnsureNotBuilt();
+                var ctor = ResolveAttributeConstructor(typeof(TAttribute), constructorArgs);
+                if (!_propertyAttributes.TryGetValue(propertyName, out var list))
+                {
+                    list = new List<CustomAttributeBuilder>();
+                    _propertyAttributes[propertyName] = list;
+                }
+                list.Add(new CustomAttributeBuilder(ctor, constructorArgs));
+                RegisterAttributeConfiguratorIfNeeded();
+                return this;
+            }
+        }
+
+        private static ConstructorInfo ResolveAttributeConstructor(Type attributeType, object[] constructorArgs)
+        {
+            var ctorTypes = constructorArgs.Select(a => a?.GetType() ?? typeof(object)).ToArray();
+            return attributeType.GetConstructor(ctorTypes)
+                ?? throw new MissingMethodException(
+                    $"[DynamicClass] '{attributeType.Name}' için ({string.Join(", ", ctorTypes.Select(t => t.Name))}) " +
+                    "parametreleriyle uyumlu bir constructor bulunamadı.");
+        }
+
+        private void RegisterAttributeConfiguratorIfNeeded()
+        {
+            // NOT: bu metot zaten _buildLock TUTULURKEN çağrılıyor (AddTypeAttribute/
+            // AddPropertyAttribute içinden). WithTypeConfigurator de aynı kilidi alıyor - ama
+            // C#'ın lock'ı (Monitor) AYNI THREAD için REENTRANT olduğundan burada deadlock OLMAZ.
+            if (_attributeConfiguratorRegistered) return;
+            _attributeConfiguratorRegistered = true;
+
+            WithTypeConfigurator((typeBuilder, members) =>
+            {
+                foreach (var attr in _typeAttributes)
+                {
+                    typeBuilder.SetCustomAttribute(attr);
+                }
+
+                foreach (var kvp in _propertyAttributes)
+                {
+                    if (!members.Properties.TryGetValue(kvp.Key, out var accessors))
+                    {
+                        throw new InvalidOperationException(
+                            $"[DynamicClass] '{kvp.Key}' property'si bulunamadı, attribute eklenemedi.");
+                    }
+
+                    foreach (var attr in kvp.Value)
+                    {
+                        accessors.Property.SetCustomAttribute(attr);
+                    }
+                }
+            });
         }
 
         public DynamicClass Build()
         {
             EnsureBuilt();
+            return this;
+        }
+
+        /// <summary>
+        /// Soğuk başlangıç JIT/derleme maliyetini öne çekmek için: property accessor'larını
+        /// (DynamicEntityAccessor) ve AddMethod ile eklenen metotların EvokerBuilder cache'ini
+        /// ÖNCEDEN derler. Uygulama açılışında, gerçek trafik başlamadan önce çağırın.
+        /// NOT: AddGenericMethod ile eklenen metotlar ısıtılmıyor - EvokerBuilder generic metot
+        /// çağırmayı desteklemiyor (bkz. bilinen kısıtlar), bu yüzden onlar için warmup'ın
+        /// karşılığı yok; generic metotların IL'i zaten Type oluşturulurken (EmitType) tek
+        /// seferlik üretiliyor, kalan tek maliyet ilk çağrıdaki normal JIT'tir.
+        /// </summary>
+        public DynamicClass Warmup()
+        {
+            EnsureBuilt();
+
+            foreach (var (name, propType) in DynamicTypeFactory.GetSchema(_type!) ?? Array.Empty<(string, Type)>())
+            {
+                var getGetter = typeof(DynamicEntityAccessor).GetMethod(nameof(DynamicEntityAccessor.GetGetter))!.MakeGenericMethod(propType);
+                getGetter.Invoke(null, new object[] { _type!, name });
+
+                var getSetter = typeof(DynamicEntityAccessor).GetMethod(nameof(DynamicEntityAccessor.GetSetter))!.MakeGenericMethod(propType);
+                getSetter.Invoke(null, new object[] { _type!, name });
+            }
+
+            var builder = new EvokerBuilder(_type!).SetInstance(_instance!);
+            foreach (var (methodName, delegateType) in _methods)
+            {
+                MethodInfo invokeMethod = delegateType.GetMethod("Invoke")!;
+                Type returnType = invokeMethod.ReturnType;
+
+                if (returnType == typeof(void))
+                {
+                    builder.GetAction(methodName);
+                }
+                else
+                {
+                    // EvokerBuilder'ın cache'i (Type, Metot, DÖNÜŞ TİPİ) üzerinden anahtarlanıyor -
+                    // ısınmanın işe yaraması için GERÇEK dönüş tipiyle ısıtmak gerekiyor, sabit
+                    // <object> ile değil (aksi halde farklı bir cache girdisini ısıtmış oluruz).
+                    var getFunc = typeof(EvokerBuilder).GetMethod(nameof(EvokerBuilder.GetFunc))!.MakeGenericMethod(returnType);
+                    getFunc.Invoke(builder, new object?[] { methodName, null });
+                }
+            }
+
             return this;
         }
 
@@ -277,20 +517,26 @@ namespace DSO.Core.Evoker
 
         public DynamicClass OnSet<T>(string propertyName, Action<T, T> onChanged)
         {
-            _onSetHooks ??= new Dictionary<string, Delegate>();
-            _onSetHooks[propertyName] = onChanged;
+            if (_onSetHooks == null)
+            {
+                lock (_buildLock) { _onSetHooks ??= new ConcurrentDictionary<string, Delegate>(); }
+            }
+            _onSetHooks![propertyName] = onChanged;
             return this;
         }
 
         public DynamicClass OnGet<T>(string propertyName, Action<T> onRead)
         {
-            _onGetHooks ??= new Dictionary<string, Delegate>();
-            _onGetHooks[propertyName] = onRead;
+            if (_onGetHooks == null)
+            {
+                lock (_buildLock) { _onGetHooks ??= new ConcurrentDictionary<string, Delegate>(); }
+            }
+            _onGetHooks![propertyName] = onRead;
             return this;
         }
 
-        public DynamicClass RemoveOnSet(string propertyName) { _onSetHooks?.Remove(propertyName); return this; }
-        public DynamicClass RemoveOnGet(string propertyName) { _onGetHooks?.Remove(propertyName); return this; }
+        public DynamicClass RemoveOnSet(string propertyName) { _onSetHooks?.TryRemove(propertyName, out _); return this; }
+        public DynamicClass RemoveOnGet(string propertyName) { _onGetHooks?.TryRemove(propertyName, out _); return this; }
 
         public object? GetValue(string propertyName)
         {
@@ -322,10 +568,18 @@ namespace DSO.Core.Evoker
         {
             if (_type != null) return;
 
-            _type = _useSchemaCache
-                ? DynamicTypeFactory.CreateType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null, _genericMethods.Count > 0 ? _genericMethods : null)
-                : DynamicTypeFactory.CreateUniqueType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null, _genericMethods.Count > 0 ? _genericMethods : null);
-            _instance = DynamicEntityAccessor.GetConstructor(_type)();
+            lock (_buildLock)
+            {
+                if (_type != null) return; // double-checked locking: iki thread aynı anda ilk çağrıyı yaparsa Type/instance SADECE BİR KEZ üretilir
+
+                Type type = _useSchemaCache
+                    ? DynamicTypeFactory.CreateType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null, _genericMethods.Count > 0 ? _genericMethods : null, _events.Count > 0 ? _events : null)
+                    : DynamicTypeFactory.CreateUniqueType(_className, _properties, _configureType, _methods.Count > 0 ? _methods : null, _genericMethods.Count > 0 ? _genericMethods : null, _events.Count > 0 ? _events : null);
+                object instance = DynamicEntityAccessor.GetConstructor(type)();
+
+                _instance = instance;
+                _type = type; // EN SON yazılıyor (volatile) - başka bir thread _type != null gördüğünde _instance'ın da hazır olduğu garanti
+            }
         }
 
         public void Dispose()

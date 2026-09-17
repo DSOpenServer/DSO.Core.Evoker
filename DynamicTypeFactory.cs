@@ -54,7 +54,7 @@ namespace DSO.Core.Evoker
         /// </summary>
         public readonly struct TypeMembers
         {
-            public IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)> Properties { get; }
+            public IReadOnlyDictionary<string, (PropertyBuilder Property, MethodBuilder Get, MethodBuilder Set)> Properties { get; }
             public IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> Methods { get; }
 
             /// <summary>
@@ -66,14 +66,19 @@ namespace DSO.Core.Evoker
             /// </summary>
             public IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> GenericMethods { get; }
 
+            /// <summary>FAZ 4c: event'ler (ör. `event EventHandler Changed;`).</summary>
+            public IReadOnlyDictionary<string, (FieldBuilder BackingField, MethodBuilder Add, MethodBuilder Remove)> Events { get; }
+
             public TypeMembers(
-                IReadOnlyDictionary<string, (MethodBuilder Get, MethodBuilder Set)> properties,
+                IReadOnlyDictionary<string, (PropertyBuilder Property, MethodBuilder Get, MethodBuilder Set)> properties,
                 IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> methods,
-                IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> genericMethods)
+                IReadOnlyDictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)> genericMethods,
+                IReadOnlyDictionary<string, (FieldBuilder BackingField, MethodBuilder Add, MethodBuilder Remove)> events)
             {
                 Properties = properties;
                 Methods = methods;
                 GenericMethods = genericMethods;
+                Events = events;
             }
         }
 
@@ -117,11 +122,12 @@ namespace DSO.Core.Evoker
             Dictionary<string, Type> properties,
             Action<TypeBuilder, TypeMembers>? configureType = null,
             Dictionary<string, Type>? methods = null,
-            Dictionary<string, MethodInfo>? genericMethods = null)
+            Dictionary<string, MethodInfo>? genericMethods = null,
+            Dictionary<string, Type>? events = null)
         {
             if (configureType != null)
             {
-                return EmitType(className, properties, configureType, methods, genericMethods);
+                return EmitType(className, properties, configureType, methods, genericMethods, events);
             }
 
             string signature = BuildSignature(className, properties, methods, genericMethods);
@@ -130,7 +136,7 @@ namespace DSO.Core.Evoker
             Type type = SchemaCache.GetOrAdd(signature, _ =>
             {
                 added = true;
-                return EmitType(className, properties, null, methods, genericMethods);
+                return EmitType(className, properties, null, methods, genericMethods, events);
             });
 
             if (added)
@@ -151,9 +157,10 @@ namespace DSO.Core.Evoker
             Dictionary<string, Type> properties,
             Action<TypeBuilder, TypeMembers>? configureType = null,
             Dictionary<string, Type>? methods = null,
-            Dictionary<string, MethodInfo>? genericMethods = null)
+            Dictionary<string, MethodInfo>? genericMethods = null,
+            Dictionary<string, Type>? events = null)
         {
-            return EmitType(className, properties, configureType, methods, genericMethods);
+            return EmitType(className, properties, configureType, methods, genericMethods, events);
         }
 
         /// <summary>
@@ -174,7 +181,7 @@ namespace DSO.Core.Evoker
             }
         }
 
-        private static string BuildSignature(string className, Dictionary<string, Type> properties, Dictionary<string, Type>? methods, Dictionary<string, MethodInfo>? genericMethods = null)
+        private static string BuildSignature(string className, Dictionary<string, Type> properties, Dictionary<string, Type>? methods, Dictionary<string, MethodInfo>? genericMethods = null, Dictionary<string, Type>? events = null)
         {
             // Dictionary'nin enumeration sırası garanti değildir; aynı şema farklı sırayla
             // verildiğinde cache miss oluşmaması için isimlere göre sıralıyoruz.
@@ -205,6 +212,15 @@ namespace DSO.Core.Evoker
                 }
             }
 
+            if (events != null && events.Count > 0)
+            {
+                sb.Append("||E");
+                foreach (var kvp in events.OrderBy(e => e.Key, StringComparer.Ordinal))
+                {
+                    sb.Append('|').Append(kvp.Key).Append(':').Append(kvp.Value.AssemblyQualifiedName);
+                }
+            }
+
             return sb.ToString();
         }
 
@@ -213,7 +229,8 @@ namespace DSO.Core.Evoker
             Dictionary<string, Type> properties,
             Action<TypeBuilder, TypeMembers>? configureType,
             Dictionary<string, Type>? methods,
-            Dictionary<string, MethodInfo>? genericMethods = null)
+            Dictionary<string, MethodInfo>? genericMethods = null,
+            Dictionary<string, Type>? events = null)
         {
             lock (ModuleLock)
             {
@@ -224,9 +241,10 @@ namespace DSO.Core.Evoker
                 string internalName = $"{className}_{id}";
 
                 var typeBuilder = moduleBuilder.DefineType(internalName, TypeAttributes.Public | TypeAttributes.Class);
-                var propertyAccessors = new Dictionary<string, (MethodBuilder Get, MethodBuilder Set)>();
+                var propertyAccessors = new Dictionary<string, (PropertyBuilder Property, MethodBuilder Get, MethodBuilder Set)>();
                 var methodForwarders = new Dictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)>();
                 var genericMethodForwarders = new Dictionary<string, (FieldBuilder DelegateField, MethodBuilder Method)>();
+                var eventForwarders = new Dictionary<string, (FieldBuilder BackingField, MethodBuilder Add, MethodBuilder Remove)>();
 
                 foreach (var prop in properties)
                 {
@@ -265,7 +283,7 @@ namespace DSO.Core.Evoker
                     propertyBuilder.SetGetMethod(getMethodBuilder);
                     propertyBuilder.SetSetMethod(setMethodBuilder);
 
-                    propertyAccessors[propName] = (getMethodBuilder, setMethodBuilder);
+                    propertyAccessors[propName] = (propertyBuilder, getMethodBuilder, setMethodBuilder);
                 }
 
                 if (methods != null)
@@ -284,9 +302,17 @@ namespace DSO.Core.Evoker
                     }
                 }
 
+                if (events != null)
+                {
+                    foreach (var e in events)
+                    {
+                        eventForwarders[e.Key] = EmitEventForwarder(typeBuilder, e.Key, e.Value);
+                    }
+                }
+
                 // GENİŞLETME NOKTASI: emisyon bitti, tip henüz "kilitlenmedi". configureType'a
                 // TypeBuilder + zaten ürettiğimiz property/metot bilgilerini veriyoruz.
-                configureType?.Invoke(typeBuilder, new TypeMembers(propertyAccessors, methodForwarders, genericMethodForwarders));
+                configureType?.Invoke(typeBuilder, new TypeMembers(propertyAccessors, methodForwarders, genericMethodForwarders, eventForwarders));
 
                 Type createdType = typeBuilder.CreateType()!;
                 SchemaByType[createdType] = properties.Select(p => (p.Key, p.Value)).ToList();
@@ -307,21 +333,16 @@ namespace DSO.Core.Evoker
         /// Func&lt;T,...&gt; bunu ifade edemez. Value-type T'ler için bu, GetValue(string)'teki
         /// gibi kaçınılmaz bir boxing/unboxing getirir.
         ///
-        /// KISIT: templateMethod hem generic HEM ref/out parametreli olamaz (iki karmaşıklığın
-        /// kesişimi bu sürümde desteklenmiyor) - böyle bir metot NotSupportedException alır.
+        /// ref/out DESTEĞİ: bir parametre ref/out ise, args[i]'ye DOĞRUDAN değeri değil, TEK
+        /// ELEMANLI bir "holder" (object[1]) array'i konur. Delegate implementasyonunuz
+        /// ((object[])args[i])[0]'ı okuyup/yazarak ref/out semantiğini simüle eder - çağrı
+        /// dönünce forwarder holder[0]'ı geri okuyup gerçek ref/out argümanına yazar.
         /// </summary>
         private static (FieldBuilder DelegateField, MethodBuilder Method) EmitGenericMethodForwarder(
             TypeBuilder typeBuilder, MethodInfo templateMethod)
         {
             Type[] templateGenericParams = templateMethod.GetGenericArguments();
             ParameterInfo[] templateParams = templateMethod.GetParameters();
-
-            if (templateParams.Any(p => p.ParameterType.IsByRef))
-            {
-                throw new NotSupportedException(
-                    $"[DynamicTypeFactory] '{templateMethod.Name}' hem generic HEM ref/out parametreli - " +
-                    "bu kombinasyon desteklenmiyor.");
-            }
 
             Type delegateFieldType = typeof(Func<Type[], object?[], object?>);
             FieldBuilder fieldBuilder = typeBuilder.DefineField($"_genericmethod_{templateMethod.Name}", delegateFieldType, FieldAttributes.Private);
@@ -336,22 +357,31 @@ namespace DSO.Core.Evoker
 
             Type SubstituteType(Type type)
             {
-                int idx = Array.IndexOf(templateGenericParams, type);
-                if (idx >= 0) return newGenericParams[idx];
+                bool byref = type.IsByRef;
+                Type t = byref ? type.GetElementType()! : type;
 
-                if (type.IsGenericType && !type.IsGenericTypeDefinition)
+                int idx = Array.IndexOf(templateGenericParams, t);
+                Type result;
+                if (idx >= 0)
                 {
-                    var args = type.GetGenericArguments().Select(SubstituteType).ToArray();
-                    return type.GetGenericTypeDefinition().MakeGenericType(args);
+                    result = newGenericParams[idx];
+                }
+                else if (t.IsGenericType && !t.IsGenericTypeDefinition)
+                {
+                    var args = t.GetGenericArguments().Select(SubstituteType).ToArray();
+                    result = t.GetGenericTypeDefinition().MakeGenericType(args);
+                }
+                else if (t.IsArray)
+                {
+                    var elem = SubstituteType(t.GetElementType()!);
+                    result = t.GetArrayRank() == 1 ? elem.MakeArrayType() : elem.MakeArrayType(t.GetArrayRank());
+                }
+                else
+                {
+                    result = t; // template'in generic parametrelerine bağlı olmayan sıradan bir tip
                 }
 
-                if (type.IsArray)
-                {
-                    var elem = SubstituteType(type.GetElementType()!);
-                    return type.GetArrayRank() == 1 ? elem.MakeArrayType() : elem.MakeArrayType(type.GetArrayRank());
-                }
-
-                return type; // template'in generic parametrelerine bağlı olmayan sıradan bir tip
+                return byref ? result.MakeByRefType() : result;
             }
 
             Type returnType = SubstituteType(templateMethod.ReturnType);
@@ -386,22 +416,64 @@ namespace DSO.Core.Evoker
             }
             il.Emit(OpCodes.Stloc, typeArgsLocal);
 
-            // object?[] args = { p1, p2, ... }  (value type'lar BOX'lanır)
+            // object?[] args = { p1, p2, ... }  (value type'lar BOX'lanır). ref/out parametreler
+            // için args[i]'ye TEK ELEMANLI bir "holder" (object[1]) konur - bkz. sınıf dokümanı.
             LocalBuilder argsLocal = il.DeclareLocal(typeof(object[]));
+            var holderLocals = new LocalBuilder?[paramTypes.Length];
+            var elemTypes = new Type[paramTypes.Length];
+            var isByRefParam = new bool[paramTypes.Length];
+
             il.Emit(OpCodes.Ldc_I4, paramTypes.Length);
             il.Emit(OpCodes.Newarr, typeof(object));
             for (int i = 0; i < paramTypes.Length; i++)
             {
+                Type pt = paramTypes[i];
+                bool byref = pt.IsByRef;
+                isByRefParam[i] = byref;
+                Type elemType = byref ? pt.GetElementType()! : pt;
+                elemTypes[i] = elemType;
+
                 il.Emit(OpCodes.Dup);
                 il.Emit(OpCodes.Ldc_I4, i);
-                il.Emit(OpCodes.Ldarg_S, (byte)(i + 1));
-                if (paramTypes[i].IsValueType || paramTypes[i].IsGenericParameter)
+
+                if (!byref)
                 {
-                    // paramTypes[i] bir generic parametre OLABİLİR (T) - Box IL'i generic
-                    // parametreler için de geçerlidir, JIT runtime'da gerçek tipe göre karar verir.
-                    il.Emit(OpCodes.Box, paramTypes[i]);
+                    il.Emit(OpCodes.Ldarg_S, (byte)(i + 1));
+                    if (elemType.IsValueType || elemType.IsGenericParameter)
+                    {
+                        // elemType bir generic parametre OLABİLİR (T) - Box IL'i generic
+                        // parametreler için de geçerlidir, JIT runtime'da gerçek tipe göre karar verir.
+                        il.Emit(OpCodes.Box, elemType);
+                    }
+                    il.Emit(OpCodes.Stelem_Ref);
                 }
-                il.Emit(OpCodes.Stelem_Ref);
+                else
+                {
+                    bool isOut = templateParams[i].IsOut;
+                    LocalBuilder holderLocal = il.DeclareLocal(typeof(object[]));
+                    holderLocals[i] = holderLocal;
+
+                    il.Emit(OpCodes.Ldc_I4_1);
+                    il.Emit(OpCodes.Newarr, typeof(object));
+
+                    if (!isOut)
+                    {
+                        // out DEĞİLSE (ref veya in) MEVCUT değeri holder[0]'a oku.
+                        il.Emit(OpCodes.Dup);
+                        il.Emit(OpCodes.Ldc_I4_0);
+                        il.Emit(OpCodes.Ldarg_S, (byte)(i + 1)); // managed pointer
+                        il.Emit(OpCodes.Ldobj, elemType);        // dereference
+                        if (elemType.IsValueType || elemType.IsGenericParameter)
+                        {
+                            il.Emit(OpCodes.Box, elemType);
+                        }
+                        il.Emit(OpCodes.Stelem_Ref);
+                    }
+
+                    il.Emit(OpCodes.Stloc, holderLocal);
+                    il.Emit(OpCodes.Ldloc, holderLocal); // args[i] = holder
+                    il.Emit(OpCodes.Stelem_Ref);
+                }
             }
             il.Emit(OpCodes.Stloc, argsLocal);
 
@@ -414,6 +486,24 @@ namespace DSO.Core.Evoker
             il.Emit(OpCodes.Ldloc, argsLocal);
             il.Emit(OpCodes.Call, typeof(DynamicTypeFactory).GetMethod(nameof(InvokeGenericMethodDelegate))!);
 
+            // Sonucu bir local'e al - byref writeback'lerini yaparken stack'i karıştırmamak için.
+            LocalBuilder resultLocal = il.DeclareLocal(typeof(object));
+            il.Emit(OpCodes.Stloc, resultLocal);
+
+            // ref/out parametrelerini holder[0]'dan GERİ OKUYUP gerçek argümana yaz.
+            for (int i = 0; i < paramTypes.Length; i++)
+            {
+                if (!isByRefParam[i]) continue;
+
+                il.Emit(OpCodes.Ldarg_S, (byte)(i + 1)); // ptr
+                il.Emit(OpCodes.Ldloc, holderLocals[i]!);
+                il.Emit(OpCodes.Ldc_I4_0);
+                il.Emit(OpCodes.Ldelem_Ref);              // holder[0] (object)
+                il.Emit(OpCodes.Unbox_Any, elemTypes[i]);
+                il.Emit(OpCodes.Stobj, elemTypes[i]);
+            }
+
+            il.Emit(OpCodes.Ldloc, resultLocal);
             if (returnType == typeof(void))
             {
                 il.Emit(OpCodes.Pop);
@@ -497,6 +587,61 @@ namespace DSO.Core.Evoker
             il.Emit(OpCodes.Ret);
 
             return (fieldBuilder, methodBuilder);
+        }
+
+        /// <summary>
+        /// FAZ 4c: bir event için add_X/remove_X forwarder'ı + gerçek bir CLR event'i üretir.
+        /// Standart C# derleyicisinin auto-event'ler için ürettiği desene benzer
+        /// (Delegate.Combine/Remove), ama BASİTLEŞTİRİLMİŞ: Interlocked.CompareExchange
+        /// tabanlı thread-safe versiyon DEĞİL - aynı event'e EŞ ZAMANLI add/remove çağrılırsa
+        /// (nadir bir senaryo) bir güncelleme kaybolabilir. Tek thread'den add/remove için
+        /// tamamen doğru ve yeterlidir.
+        /// </summary>
+        private static (FieldBuilder BackingField, MethodBuilder Add, MethodBuilder Remove) EmitEventForwarder(
+            TypeBuilder typeBuilder, string eventName, Type handlerType)
+        {
+            FieldBuilder fieldBuilder = typeBuilder.DefineField($"_event_{eventName}", handlerType, FieldAttributes.Private);
+
+            MethodInfo combine = typeof(Delegate).GetMethod(nameof(Delegate.Combine), new[] { typeof(Delegate), typeof(Delegate) })!;
+            MethodInfo remove = typeof(Delegate).GetMethod(nameof(Delegate.Remove), new[] { typeof(Delegate), typeof(Delegate) })!;
+
+            MethodBuilder addMethod = typeBuilder.DefineMethod(
+                $"add_{eventName}",
+                MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.HideBySig | MethodAttributes.Virtual | MethodAttributes.NewSlot,
+                typeof(void), new[] { handlerType });
+            {
+                ILGenerator il = addMethod.GetILGenerator();
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, fieldBuilder);
+                il.Emit(OpCodes.Ldarg_1);
+                il.Emit(OpCodes.Call, combine);
+                il.Emit(OpCodes.Castclass, handlerType);
+                il.Emit(OpCodes.Stfld, fieldBuilder);
+                il.Emit(OpCodes.Ret);
+            }
+
+            MethodBuilder removeMethod = typeBuilder.DefineMethod(
+                $"remove_{eventName}",
+                MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.HideBySig | MethodAttributes.Virtual | MethodAttributes.NewSlot,
+                typeof(void), new[] { handlerType });
+            {
+                ILGenerator il = removeMethod.GetILGenerator();
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldfld, fieldBuilder);
+                il.Emit(OpCodes.Ldarg_1);
+                il.Emit(OpCodes.Call, remove);
+                il.Emit(OpCodes.Castclass, handlerType);
+                il.Emit(OpCodes.Stfld, fieldBuilder);
+                il.Emit(OpCodes.Ret);
+            }
+
+            EventBuilder eventBuilder = typeBuilder.DefineEvent(eventName, EventAttributes.None, handlerType);
+            eventBuilder.SetAddOnMethod(addMethod);
+            eventBuilder.SetRemoveOnMethod(removeMethod);
+
+            return (fieldBuilder, addMethod, removeMethod);
         }
 
         /// <summary>
