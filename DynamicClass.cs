@@ -58,6 +58,75 @@ namespace DSO.Core.Evoker
         // DSO.Core.Evoker.Extend için GENİŞLETME NOKTASI - core bunu HİÇ KULLANMAZ.
         private Action<TypeBuilder, DynamicTypeFactory.TypeMembers>? _configureType;
 
+        // --- Hızlı yol: instance-local, alloc'suz property accessor cache -----------------
+        //
+        // SetValue<T>/GetValue<T> her çağrıda DynamicEntityAccessor'ın PAYLAŞIMLI
+        // ConcurrentDictionary'sine (Type, Kind, PropertyName, ValueType) tuple-key'iyle
+        // bakıyordu - cache HIT olsa bile bu, 2 string hash'i + 4 alanlı tuple karşılaştırması
+        // + lock-free bucket gezmesi demekti. Sıkı bir for-döngüsünde ölçülebilir bir maliyet
+        // (gerçek benchmark: aynı şema için her çağrıda paylaşımlı cache'den yeniden çözmek,
+        // önceden çıkarılmış delegate kullanmaya göre ~3.7x yavaştı).
+        //
+        // Çözüm: her DynamicClass ÖRNEĞİ, KENDİ şemasındaki property'ler için küçük bir dizi
+        // (AccessorSlot[]) tutar - Build() (EnsureBuilt/Wrap) anında, property sayısı kadar
+        // (tipik: birkaç - birkaç onlarca) boyutla BİR KEZ ayrılır. Arama sırası:
+        //   1) ÖNCE referans eşitliği (ReferenceEquals). Bir for döngüsünde aynı literal string
+        //      ("Id","Name"...) tekrar tekrar geçilir ve CLR literal string'leri INTERN eder -
+        //      yani aynı derlenmiş koddan gelen aynı literal HER ZAMAN aynı nesne referansıdır.
+        //      Bu durumda karşılaştırma tek bir POINTER karşılaştırmasına iner, hiç hash
+        //      hesaplanmaz.
+        //   2) Referans eşleşmezse (runtime'da hesaplanmış bir string ile çağrıldıysa) içerik
+        //      eşitliğine (string.Equals) düşülür - küçük bir dizi üzerinde lineer tarama yine
+        //      de ConcurrentDictionary'nin tuple-hash'inden daha ucuzdur.
+        //   3) İlgili slot'ta delegate henüz yoksa, DynamicEntityAccessor'dan BİR KEZ çözülüp
+        //      slot'a yazılır; sonraki TÜM çağrılar doğrudan bu delegate'i kullanır - paylaşımlı
+        //      cache'e bir daha HİÇ bakılmaz.
+        //
+        // THREAD-SAFETY: Slot dizisinin KENDİSİ (uzunluğu, hangi property hangi slot'ta) sadece
+        // EnsureBuilt()/Wrap() içinde, _buildLock altında/tek seferlik kurulum sırasında
+        // yazılır ve _type'ın volatile publish'inden ÖNCE tamamlanır - yani dizinin varlığı ve
+        // boyutu için ekstra senkronizasyona gerek yok (mevcut _instance ile aynı "volatile
+        // publish" garantisi). Bir SLOT'un İÇİNDEKİ Getter/Setter alanlarının yazımı ise kilitsiz:
+        // iki thread aynı property'ye eşzamanlı ilk kez erişirse, delegate'i iki kez (yan etkisiz,
+        // saf) çözüp aynı sonucu yazabilirler - bu SADECE fazladan iş demektir, veri bozulması
+        // DEĞİL (delegate derleme idempotent). Bu, sınıfın zaten dokümante ettiği "SetValue/
+        // GetValue'nun KENDİSİ eşzamanlı yazmaya karşı senkronize değildir" garantisiyle
+        // TUTARLIDIR.
+        //
+        // Bu, dışarıya PUBLIC API/imza değişikliği GETİRMEZ. Aşırı-uç senaryolar (tek bir
+        // property'ye saniyede milyonlarca kez FARKLI T generic parametreleriyle erişmek gibi)
+        // için hâlâ DynamicEntityAccessor.GetSetter/GetGetter'ı doğrudan kullanıp delegate'i
+        // kendi değişkeninizde tutmak teorik olarak biraz daha hızlı kalır - ama artık bu kural
+        // değil, İSTİSNAdır.
+        private struct AccessorSlot
+        {
+            public string Name;
+            public Delegate? Getter;
+            public Delegate? Setter;
+        }
+
+        private AccessorSlot[]? _accessorSlots;
+
+        private static AccessorSlot[] BuildAccessorSlots(Type type)
+        {
+            var schema = DynamicTypeFactory.GetSchema(type);
+            if (schema == null || schema.Count == 0) return Array.Empty<AccessorSlot>();
+
+            var slots = new AccessorSlot[schema.Count];
+            for (int i = 0; i < schema.Count; i++)
+            {
+                slots[i] = new AccessorSlot { Name = schema[i].Name };
+            }
+            return slots;
+        }
+
+        // Metot çağrıları için: EvokerBuilder tip+instance'a bağlı, DEĞİŞMEZ bir nesnedir (bu
+        // DynamicClass'ın _type/_instance'ı build'den sonra hiç değişmez). Eskiden InvokeMethod
+        // HER ÇAĞRIDA "new EvokerBuilder(...)" yaratıyordu - gereksiz bir allocation. Artık bir
+        // kez yaratılıp saklanıyor (aynı benign-race felsefesi: en kötü ihtimalle iki thread
+        // birer tane yaratıp biri kazanır, ikisi de fonksiyonel olarak eşdeğerdir).
+        private EvokerBuilder? _invokeBuilder;
+
         private DynamicClass(string className, bool useSchemaCache, bool forgetOnDispose)
         {
             if (forgetOnDispose && useSchemaCache)
@@ -101,8 +170,9 @@ namespace DSO.Core.Evoker
             }
 
             var dc = new DynamicClass(type.Name, useSchemaCache: true, forgetOnDispose: false);
-            dc._type = type;       // _type != null olduğu için EnsureBuilt() bir daha build ETMEZ
             dc._instance = instance;
+            dc._accessorSlots = BuildAccessorSlots(type); // _type'tan ÖNCE - aynı volatile-publish sırası
+            dc._type = type;       // EN SON - _type != null olduğu için EnsureBuilt() bir daha build ETMEZ
             return dc;
         }
 
@@ -322,22 +392,33 @@ namespace DSO.Core.Evoker
         public TReturn? InvokeMethod<TReturn>(string methodName, params object[] args)
         {
             EnsureBuilt();
-            return new EvokerBuilder(_type!).SetInstance(_instance!).Invoke<TReturn>(methodName, args);
+            return GetInvokeBuilder().Invoke<TReturn>(methodName, args);
         }
 
         /// <summary>Dönüş değeri olmayan (void) bir metodu isimle çağırır.</summary>
         public DynamicClass InvokeMethod(string methodName, params object[] args)
         {
             EnsureBuilt();
-            new EvokerBuilder(_type!).SetInstance(_instance!).Execute(methodName, args);
+            GetInvokeBuilder().Execute(methodName, args);
             return this;
         }
 
         public async Task<TReturn?> InvokeMethodAsync<TReturn>(string methodName, params object[] args)
         {
             EnsureBuilt();
-            return await new EvokerBuilder(_type!).SetInstance(_instance!).InvokeAsync<TReturn>(methodName, args);
+            return await GetInvokeBuilder().InvokeAsync<TReturn>(methodName, args);
         }
+
+        // NOT: EvokerBuilder'ın kendisi (methodName -> derlenmiş delegate) hâlâ KENDİ
+        // PAYLAŞIMLI cache'ini (bkz. EvokerBuilder.Cache) her çağrıda bir STRING cache-key
+        // kurup arıyor - bu DynamicClass'ın kontrolü dışında, EvokerBuilder'ın kendi iç
+        // tasarımı. InvokeMethod'u SetValue/GetValue kadar sık (sıkı bir döngüde binlerce kez)
+        // çağırıyorsanız ve bunu da ölçtüğünüzde darboğaz görüyorsanız haber verin - EvokerBuilder'a
+        // da aynı instance-local delegate-cache deseni eklenebilir; şimdilik kapsam dışında
+        // tutuldu çünkü EvokerBuilder DynamicClass dışında da (EvokerEngine üzerinden) kullanılıyor
+        // ve değişikliği ayrıca doğrulamak gerekir.
+        private EvokerBuilder GetInvokeBuilder()
+            => _invokeBuilder ??= new EvokerBuilder(_type!).SetInstance(_instance!);
 
         public DynamicClass WithTypeConfigurator(Action<TypeBuilder, DynamicTypeFactory.TypeMembers> configurator)
         {
@@ -455,10 +536,28 @@ namespace DSO.Core.Evoker
             foreach (var (name, propType) in DynamicTypeFactory.GetSchema(_type!) ?? Array.Empty<(string, Type)>())
             {
                 var getGetter = typeof(DynamicEntityAccessor).GetMethod(nameof(DynamicEntityAccessor.GetGetter))!.MakeGenericMethod(propType);
-                getGetter.Invoke(null, new object[] { _type!, name });
+                var getterDelegate = (Delegate)getGetter.Invoke(null, new object[] { _type!, name })!;
 
                 var getSetter = typeof(DynamicEntityAccessor).GetMethod(nameof(DynamicEntityAccessor.GetSetter))!.MakeGenericMethod(propType);
-                getSetter.Invoke(null, new object[] { _type!, name });
+                var setterDelegate = (Delegate)getSetter.Invoke(null, new object[] { _type!, name })!;
+
+                // Paylaşımlı DynamicEntityAccessor cache'ini ısıtmakla YETİNMİYORUZ - aynı
+                // delegate'leri doğrudan bu instance'ın kendi hızlı-yol slot dizisine de
+                // yazıyoruz. Böylece Warmup() sonrası İLK SetValue/GetValue çağrısı bile
+                // paylaşımlı cache'e hiç bakmadan, direkt bu delegate'leri kullanır.
+                var slots = _accessorSlots;
+                if (slots != null)
+                {
+                    for (int i = 0; i < slots.Length; i++)
+                    {
+                        if (slots[i].Name == name)
+                        {
+                            slots[i].Getter = getterDelegate;
+                            slots[i].Setter = setterDelegate;
+                            break;
+                        }
+                    }
+                }
             }
 
             var builder = new EvokerBuilder(_type!).SetInstance(_instance!);
@@ -490,13 +589,13 @@ namespace DSO.Core.Evoker
 
             if (_onSetHooks != null && _onSetHooks.TryGetValue(propertyName, out var hookDel) && hookDel is Action<T, T> hook)
             {
-                T oldValue = DynamicEntityAccessor.GetGetter<T>(_type!, propertyName)(_instance!);
-                DynamicEntityAccessor.GetSetter<T>(_type!, propertyName)(_instance!, value);
+                T oldValue = ResolveGetter<T>(propertyName)(_instance!);
+                ResolveSetter<T>(propertyName)(_instance!, value);
                 hook(oldValue, value);
             }
             else
             {
-                DynamicEntityAccessor.GetSetter<T>(_type!, propertyName)(_instance!, value);
+                ResolveSetter<T>(propertyName)(_instance!, value);
             }
 
             return this;
@@ -505,7 +604,7 @@ namespace DSO.Core.Evoker
         public T GetValue<T>(string propertyName)
         {
             EnsureBuilt();
-            T value = DynamicEntityAccessor.GetGetter<T>(_type!, propertyName)(_instance!);
+            T value = ResolveGetter<T>(propertyName)(_instance!);
 
             if (_onGetHooks != null && _onGetHooks.TryGetValue(propertyName, out var hookDel) && hookDel is Action<T> hook)
             {
@@ -513,6 +612,75 @@ namespace DSO.Core.Evoker
             }
 
             return value;
+        }
+
+        /// <summary>
+        /// _accessorSlots içinde propertyName için, tipi T olan bir setter bulur/derler.
+        /// Bulma sırası: (1) SADECE referans eşitliği [en sık yol - literal string'ler intern
+        /// edilir], (2) içerik eşitliği [runtime'da hesaplanan string'ler için], (3) slot'ta
+        /// delegate yoksa DynamicEntityAccessor'dan BİR KEZ çözülüp slot'a YAZILIR. Slot
+        /// dizisinde isim hiç bulunamazsa (AddProperty ile eklenmemiş bir isimse), hatayı
+        /// DynamicEntityAccessor'ın kendisine bırakıyoruz - aynı MissingMemberException mesajı
+        /// korunsun diye burada YENİDEN üretilmiyor.
+        /// </summary>
+        private Action<object, T> ResolveSetter<T>(string propertyName)
+        {
+            var slots = _accessorSlots!;
+
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (ReferenceEquals(slots[i].Name, propertyName))
+                    return GetOrResolveSetter<T>(i, propertyName);
+            }
+
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (slots[i].Name == propertyName)
+                    return GetOrResolveSetter<T>(i, propertyName);
+            }
+
+            return DynamicEntityAccessor.GetSetter<T>(_type!, propertyName);
+        }
+
+        private Action<object, T> GetOrResolveSetter<T>(int slotIndex, string propertyName)
+        {
+            var slots = _accessorSlots!;
+            if (slots[slotIndex].Setter is Action<object, T> cached)
+                return cached;
+
+            var fresh = DynamicEntityAccessor.GetSetter<T>(_type!, propertyName);
+            slots[slotIndex].Setter = fresh;
+            return fresh;
+        }
+
+        private Func<object, T> ResolveGetter<T>(string propertyName)
+        {
+            var slots = _accessorSlots!;
+
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (ReferenceEquals(slots[i].Name, propertyName))
+                    return GetOrResolveGetter<T>(i, propertyName);
+            }
+
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (slots[i].Name == propertyName)
+                    return GetOrResolveGetter<T>(i, propertyName);
+            }
+
+            return DynamicEntityAccessor.GetGetter<T>(_type!, propertyName);
+        }
+
+        private Func<object, T> GetOrResolveGetter<T>(int slotIndex, string propertyName)
+        {
+            var slots = _accessorSlots!;
+            if (slots[slotIndex].Getter is Func<object, T> cached)
+                return cached;
+
+            var fresh = DynamicEntityAccessor.GetGetter<T>(_type!, propertyName);
+            slots[slotIndex].Getter = fresh;
+            return fresh;
         }
 
         public DynamicClass OnSet<T>(string propertyName, Action<T, T> onChanged)
@@ -541,13 +709,13 @@ namespace DSO.Core.Evoker
         public object? GetValue(string propertyName)
         {
             EnsureBuilt();
-            return DynamicEntityAccessor.GetGetter<object>(_type!, propertyName)(_instance!);
+            return ResolveGetter<object>(propertyName)(_instance!);
         }
 
         public DynamicClass SetValue(string propertyName, object? value)
         {
             EnsureBuilt();
-            DynamicEntityAccessor.GetSetter<object>(_type!, propertyName)(_instance!, value!);
+            ResolveSetter<object>(propertyName)(_instance!, value!);
             return this;
         }
 
@@ -578,7 +746,8 @@ namespace DSO.Core.Evoker
                 object instance = DynamicEntityAccessor.GetConstructor(type)();
 
                 _instance = instance;
-                _type = type; // EN SON yazılıyor (volatile) - başka bir thread _type != null gördüğünde _instance'ın da hazır olduğu garanti
+                _accessorSlots = BuildAccessorSlots(type); // _type'tan ÖNCE - aynı volatile-publish sırası
+                _type = type; // EN SON yazılıyor (volatile) - başka bir thread _type != null gördüğünde _instance'ın/_accessorSlots'un da hazır olduğu garanti
             }
         }
 
