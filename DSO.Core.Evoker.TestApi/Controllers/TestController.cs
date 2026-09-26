@@ -11,9 +11,11 @@ namespace DSO.Core.Evoker.TestApi.Controllers
         [HttpGet("Test1")]
         public void Test1()
         {
-            var run = EvokerEngine.InvokePublic<TestClass1,string>("Run", 5, "text alanı");
+            var run = EvokerEngine.InvokePublic<TestClass1, string>("Run", 5, "text alanı");
+            var p = new Program();
+           
 
-            var run2 = EvokerEngine.InvokePublic<TestClass1,int>("Run2");
+            var run2 = EvokerEngine.InvokePublic<TestClass1, int>("Run2");
         }
 
         [HttpGet("Test2Contractor")]
@@ -69,7 +71,7 @@ namespace DSO.Core.Evoker.TestApi.Controllers
             };
 
             Type dynamicType = DynamicTypeFactory.CreateType("DynamicCustomer", props);
-            
+
             var ctor = DynamicEntityAccessor.GetConstructor(dynamicType);
             object instance = ctor();
 
