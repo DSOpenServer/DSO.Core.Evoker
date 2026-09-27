@@ -127,8 +127,12 @@ namespace DSO.Core.Evoker
             var call = BuildCallExpression(methodInfo, instanceParam, argsParam);
 
             Expression body = call;
-            if (methodInfo.ReturnType != typeof(void) && !typeof(TReturn).IsAssignableFrom(methodInfo.ReturnType))
+            if (methodInfo.ReturnType != typeof(void) && methodInfo.ReturnType != typeof(TReturn))
             {
+                // Bkz. DSO.Core.Evoker.Plugins çalışmasında bulunan hata: Type.IsAssignableFrom
+                // value type -> object/interface için boxing sayesinde "assignable" der, ama
+                // Expression.Lambda value type'tan object'e implicit boxing conversion eklemez.
+                // Expression.Convert hem boxing'i hem reference upcast/downcast'ı doğru ele alır.
                 body = Expression.Convert(call, typeof(TReturn));
             }
 
