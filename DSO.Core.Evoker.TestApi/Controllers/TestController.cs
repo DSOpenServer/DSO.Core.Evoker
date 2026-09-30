@@ -12,8 +12,6 @@ namespace DSO.Core.Evoker.TestApi.Controllers
         public void Test1()
         {
             var run = EvokerEngine.InvokePublic<TestClass1, string>("Run", 5, "text alanı");
-            var p = new Program();
-           
 
             var run2 = EvokerEngine.InvokePublic<TestClass1, int>("Run2");
         }

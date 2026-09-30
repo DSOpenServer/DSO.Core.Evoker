@@ -535,11 +535,16 @@ namespace DSO.Core.Evoker
 
             foreach (var (name, propType) in DynamicTypeFactory.GetSchema(_type!) ?? Array.Empty<(string, Type)>())
             {
+                // NOT: MethodInfo.Invoke eksik argüman için optional parametrenin varsayılanını
+                // OTOMATİK uygulamaz - GetGetter/GetSetter'ın 3. (includeNonPublic) parametresi burada
+                // açıkça geçilmezse TargetParameterCountException fırlatır. DynamicClass'ın kendi ürettiği
+                // property'ler HER ZAMAN public'tir (bkz. DynamicTypeFactory - Reflection.Emit ile hep
+                // MethodAttributes.Public), dolayısıyla burada includeNonPublic her zaman false.
                 var getGetter = typeof(DynamicEntityAccessor).GetMethod(nameof(DynamicEntityAccessor.GetGetter))!.MakeGenericMethod(propType);
-                var getterDelegate = (Delegate)getGetter.Invoke(null, new object[] { _type!, name })!;
+                var getterDelegate = (Delegate)getGetter.Invoke(null, new object[] { _type!, name, false })!;
 
                 var getSetter = typeof(DynamicEntityAccessor).GetMethod(nameof(DynamicEntityAccessor.GetSetter))!.MakeGenericMethod(propType);
-                var setterDelegate = (Delegate)getSetter.Invoke(null, new object[] { _type!, name })!;
+                var setterDelegate = (Delegate)getSetter.Invoke(null, new object[] { _type!, name, false })!;
 
                 // Paylaşımlı DynamicEntityAccessor cache'ini ısıtmakla YETİNMİYORUZ - aynı
                 // delegate'leri doğrudan bu instance'ın kendi hızlı-yol slot dizisine de

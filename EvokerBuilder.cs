@@ -22,6 +22,21 @@ namespace DSO.Core.Evoker
             _includeNonPublic = includeNonPublic;
         }
 
+        /// <summary>Bu builder'ın bağlı olduğu Type - dışarıdan salt-okunur erişim (bkz. DSO.Core.Evoker.Plugins).</summary>
+        public Type Type => _type;
+
+        /// <summary>SADECE SetInstance ile bağlanmış nesneyi döner - null ise sabit instance yok (bkz. EvokerBuilderPropertyExtensions).</summary>
+        public object? Instance => _existingInstance;
+
+        /// <summary>
+        /// Constructor'da verilen includeNonPublic - dışarıdan salt-okunur erişim. Invoke/Execute zaten
+        /// bunu GetMethodInfo'da kullanıyordu (private/protected metotlar); GetValue/SetValue (bkz.
+        /// EvokerBuilderPropertyExtensions) de private/protected property ve field'lar için AYNI bayrağı
+        /// kullanır - "bu builder private üyeleri görebiliyor mu" tek bir yerde (constructor'da) karar
+        /// verilir, Invoke/Execute/GetValue/SetValue hepsi bu tek karara uyar.
+        /// </summary>
+        public bool IncludeNonPublic => _includeNonPublic;
+
         // Var olan bir nesne örneğini bağlamak için
         public EvokerBuilder SetInstance(object instance)
         {
@@ -277,7 +292,7 @@ namespace DSO.Core.Evoker
 
             try
             {
-                return Activator.CreateInstance(_type);
+                return DynamicEntityAccessor.GetConstructor(_type)();
             }
             catch (MissingMethodException)
             {

@@ -24,7 +24,10 @@ namespace DSO.Core.Evoker
     /// </summary>
     public static class DynamicEntityAccessor
     {
-        private static readonly ConcurrentDictionary<Type, Func<object>> ConstructorCache = new();
+        // Key'e includeNonPublic de dahil: aynı tip için hem "sadece public ctor" hem "private ctor
+        // dahil" arama farklı sonuçlar üretebilir (ör. tip SADECE private parametresiz ctor'a sahipse),
+        // ikisi aynı cache girdisini paylaşırsa biri diğerini ezer.
+        private static readonly ConcurrentDictionary<(Type Type, bool IncludeNonPublic), Func<object>> ConstructorCache = new();
 
         // ÖNEMLİ: Key olarak STRING değil, value-tuple kullanılıyor. String interpolation
         // (ör. $"{type}.{kind}_{prop}:{valueType}") her çağrıda -CACHE HIT olsa bile- yeni bir
@@ -54,7 +57,13 @@ namespace DSO.Core.Evoker
         /// </summary>
         public static void ForgetType(Type type)
         {
-            ConstructorCache.TryRemove(type, out _);
+            foreach (var key in ConstructorCache.Keys)
+            {
+                if (key.Type == type)
+                {
+                    ConstructorCache.TryRemove(key, out _);
+                }
+            }
 
             foreach (var key in AccessorCache.Keys)
             {
@@ -69,19 +78,25 @@ namespace DSO.Core.Evoker
         /// Parametresiz constructor'ı DERLENMİŞ bir delegate olarak döner. Activator.CreateInstance
         /// her çağrıda reflection üzerinden çözümleme yaptığı için satır-başına nesne yaratmada
         /// belirgin şekilde daha yavaştır; burada derleme maliyeti sadece İLK çağrıda ödenir.
+        /// <paramref name="includeNonPublic"/> true ise private/protected parametresiz constructor'lar
+        /// da bulunur - Type.GetConstructor(Type.EmptyTypes) (parametresiz overload) SADECE public
+        /// instance ctor arar, plugin tipinin tek ctor'u private/protected ise bunu asla bulamaz.
         /// </summary>
-        public static Func<object> GetConstructor(Type type)
+        public static Func<object> GetConstructor(Type type, bool includeNonPublic = false)
         {
-            if (ConstructorCache.TryGetValue(type, out var existing))
+            var key = (type, includeNonPublic);
+            if (ConstructorCache.TryGetValue(key, out var existing))
             {
                 return existing;
             }
 
-            return ConstructorCache.GetOrAdd(type, t =>
+            return ConstructorCache.GetOrAdd(key, k =>
             {
-                var ctor = t.GetConstructor(Type.EmptyTypes)
+                var flags = BindingFlags.Instance | BindingFlags.Public
+                    | (k.IncludeNonPublic ? BindingFlags.NonPublic : 0);
+                var ctor = k.Type.GetConstructor(flags, binder: null, Type.EmptyTypes, modifiers: null)
                     ?? throw new MissingMethodException(
-                        $"[DynamicEntityAccessor] '{t.Name}' türünün parametresiz constructor'ı yok.");
+                        $"[DynamicEntityAccessor] '{k.Type.Name}' türünün{(k.IncludeNonPublic ? "" : " (public)")} parametresiz constructor'ı yok.");
 
                 var newExpr = Expression.New(ctor);
                 var lambda = Expression.Lambda<Func<object>>(Expression.Convert(newExpr, typeof(object)));
@@ -90,11 +105,23 @@ namespace DSO.Core.Evoker
         }
 
         /// <summary>
-        /// Belirtilen property için boxing'siz, tipe özel bir getter delegate'i döner (cache'li).
+        /// Belirtilen property (ya da property yoksa aynı isimli alan/field - fallback) için
+        /// boxing'siz, tipe özel bir getter delegate'i döner (cache'li).
+        /// <paramref name="includeNonPublic"/> true ise private/protected/internal property ve
+        /// field'lar da aranır - plugin senaryosunda 3. parti bir DLL'in dışarı açmadığı bir
+        /// alanı/property'yi (ör. admin/tanılama amaçlı) okumak için. Varsayılan false: eskisi gibi
+        /// sadece public üyeler görünür - mevcut çağıran kodlar davranış DEĞİŞTİRMEDEN çalışmaya
+        /// devam eder.
         /// </summary>
-        public static Func<object, TValue> GetGetter<TValue>(Type type, string propertyName)
+        public static Func<object, TValue> GetGetter<TValue>(Type type, string propertyName, bool includeNonPublic = false)
         {
-            var key = (type, "get", propertyName, typeof(TValue));
+            // NOT: Kind string'ine "-np" eklenerek public/non-public aramalar AYRI cache girdileri
+            // olarak tutuluyor - key tuple'ının şeklini (Type/Kind/PropertyName/ValueType) değiştirmeden.
+            // Aksi halde aynı (Type, PropertyName) için ÖNCE public modda arayıp bulunamadıysa, SONRA
+            // non-public modda arayan bir çağıran, ikinci çağrıda yanlışlıkla ilk (başarısız olmuş
+            // olabilecek) sonucu cache'ten görebilirdi.
+            string kind = includeNonPublic ? "get-np" : "get";
+            var key = (type, kind, propertyName, typeof(TValue));
 
             // Önce closure/lambda ALLOCATE ETMEDEN dene (cache hit - hot path, %99 durum budur).
             if (AccessorCache.TryGetValue(key, out var existing))
@@ -107,17 +134,17 @@ namespace DSO.Core.Evoker
             // 'type'/'propertyName' için closure nesnesini metot girişinde (if'ten ÖNCE)
             // allocate edebiliyordu - yani "hit path'te de" sessizce alloc oluyordu. Ayrı
             // metoda taşımak bu riski ortadan kaldırır (empirik olarak doğruladık).
-            return (Func<object, TValue>)CreateAndCacheGetter<TValue>(key, type, propertyName);
+            return (Func<object, TValue>)CreateAndCacheGetter<TValue>(key, type, propertyName, includeNonPublic);
         }
 
         private static Delegate CreateAndCacheGetter<TValue>(
-            (Type Type, string Kind, string PropertyName, Type ValueType) key, Type type, string propertyName)
+            (Type Type, string Kind, string PropertyName, Type ValueType) key, Type type, string propertyName, bool includeNonPublic)
         {
             bool added = false;
             var del = AccessorCache.GetOrAdd(key, _ =>
             {
                 added = true;
-                return BuildGetter<TValue>(type, propertyName);
+                return BuildGetter<TValue>(type, propertyName, includeNonPublic);
             });
 
             if (added)
@@ -130,28 +157,31 @@ namespace DSO.Core.Evoker
         }
 
         /// <summary>
-        /// Belirtilen property için boxing'siz, tipe özel bir setter delegate'i döner (cache'li).
+        /// Belirtilen property (ya da property yoksa aynı isimli alan/field - fallback, readonly/const
+        /// hariç) için boxing'siz, tipe özel bir setter delegate'i döner (cache'li).
+        /// <paramref name="includeNonPublic"/> - bkz. <see cref="GetGetter{TValue}"/>.
         /// </summary>
-        public static Action<object, TValue> GetSetter<TValue>(Type type, string propertyName)
+        public static Action<object, TValue> GetSetter<TValue>(Type type, string propertyName, bool includeNonPublic = false)
         {
-            var key = (type, "set", propertyName, typeof(TValue));
+            string kind = includeNonPublic ? "set-np" : "set";
+            var key = (type, kind, propertyName, typeof(TValue));
 
             if (AccessorCache.TryGetValue(key, out var existing))
             {
                 return (Action<object, TValue>)existing;
             }
 
-            return (Action<object, TValue>)CreateAndCacheSetter<TValue>(key, type, propertyName);
+            return (Action<object, TValue>)CreateAndCacheSetter<TValue>(key, type, propertyName, includeNonPublic);
         }
 
         private static Delegate CreateAndCacheSetter<TValue>(
-            (Type Type, string Kind, string PropertyName, Type ValueType) key, Type type, string propertyName)
+            (Type Type, string Kind, string PropertyName, Type ValueType) key, Type type, string propertyName, bool includeNonPublic)
         {
             bool added = false;
             var del = AccessorCache.GetOrAdd(key, _ =>
             {
                 added = true;
-                return BuildSetter<TValue>(type, propertyName);
+                return BuildSetter<TValue>(type, propertyName, includeNonPublic);
             });
 
             if (added)
@@ -177,15 +207,19 @@ namespace DSO.Core.Evoker
 
                 foreach (var (name, propType) in props)
                 {
+                    // NOT: MethodInfo.Invoke, eksik argüman için OTOMATİK olarak optional parametrenin
+                    // varsayılanını uygulamaz (bu sadece C# derleyicisinin bir kolaylığıdır) - GetGetter/
+                    // GetSetter'ın 3. (includeNonPublic) parametresi burada AÇIKÇA geçilmezse
+                    // TargetParameterCountException fırlatır. Warmup her zaman public erişimi ısıtır.
                     var getGetter = typeof(DynamicEntityAccessor)
                         .GetMethod(nameof(GetGetter))!
                         .MakeGenericMethod(propType);
-                    getGetter.Invoke(null, new object[] { type, name });
+                    getGetter.Invoke(null, new object[] { type, name, false });
 
                     var getSetter = typeof(DynamicEntityAccessor)
                         .GetMethod(nameof(GetSetter))!
                         .MakeGenericMethod(propType);
-                    getSetter.Invoke(null, new object[] { type, name });
+                    getSetter.Invoke(null, new object[] { type, name, false });
                 }
             }
         }
@@ -198,7 +232,16 @@ namespace DSO.Core.Evoker
             }
         }
 
-        private static Delegate BuildGetter<TValue>(Type type, string propertyName)
+        // Instance + DeclaredOnly HER ZAMAN sabit (bkz. yorum aşağıda - base class çakışması).
+        // Public/NonPublic ise includeNonPublic parametresine göre RUNTIME'da ekleniyor.
+        private const System.Reflection.BindingFlags BaseMemberFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly;
+
+        private static System.Reflection.BindingFlags MemberFlags(bool includeNonPublic) =>
+            BaseMemberFlags | System.Reflection.BindingFlags.Public
+            | (includeNonPublic ? System.Reflection.BindingFlags.NonPublic : 0);
+
+        private static Delegate BuildGetter<TValue>(Type type, string propertyName, bool includeNonPublic = false)
         {
             // NOT: DeclaredOnly ZORUNLU. DSO.Core.Evoker.Extend ile bir base class'tan türetilen
             // tiplerde (bkz. Faz 2), bizim ürettiğimiz property (ör. "Name") ile base class'ın
@@ -207,44 +250,97 @@ namespace DSO.Core.Evoker
             // arasında karar veremeyip AmbiguousMatchException fırlatır - bunu deneyerek bulduk.
             // DeclaredOnly, sadece BİZİM emit ettiğimiz (type'ın kendi üzerinde tanımlı) property'yi
             // hedefler, ki zaten her zaman doğru olan budur.
-            var property = type.GetProperty(propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly)
-                ?? throw new MissingMemberException(type.Name, propertyName);
-            var getMethod = property.GetGetMethod()
-                ?? throw new MissingMethodException(
-                    $"[DynamicEntityAccessor] '{propertyName}' için erişilebilir bir get metodu yok.");
+            var flags = MemberFlags(includeNonPublic);
+            var property = type.GetProperty(propertyName, flags);
+            if (property != null)
+            {
+                // includeNonPublic=true iken GetGetMethod(true) çağrılıyor - property PUBLIC olsa bile
+                // get'i private olabilir (ör. "public string Name { get; private set; }" - Set için
+                // NonPublic gerekir ama Get zaten public'tir; tersi de mümkün: property NonPublic
+                // arandığı için bulunduysa get metodu da genelde NonPublic'tir). GetGetMethod(true)
+                // her iki durumda da "var olan en erişilebilir get'i" değil, GERÇEK get metodunu döner.
+                var getMethod = property.GetGetMethod(includeNonPublic)
+                    ?? throw new MissingMethodException(
+                        $"[DynamicEntityAccessor] '{propertyName}' için erişilebilir bir get metodu yok.");
 
-            var instanceParam = Expression.Parameter(typeof(object), "instance");
-            var typedInstance = Expression.Convert(instanceParam, type);
-            var call = Expression.Call(typedInstance, getMethod);
+                var instanceParamP = Expression.Parameter(typeof(object), "instance");
+                var typedInstanceP = Expression.Convert(instanceParamP, type);
+                var call = Expression.Call(typedInstanceP, getMethod);
 
-            Expression body = getMethod.ReturnType == typeof(TValue)
-                ? call
-                : Expression.Convert(call, typeof(TValue));
+                Expression bodyP = getMethod.ReturnType == typeof(TValue)
+                    ? call
+                    : Expression.Convert(call, typeof(TValue));
 
-            var lambda = Expression.Lambda<Func<object, TValue>>(body, instanceParam);
-            return lambda.Compile();
+                return Expression.Lambda<Func<object, TValue>>(bodyP, instanceParamP).Compile();
+            }
+
+            // Property bulunamadı - PLUGIN senaryosunda (3. parti DLL, arayüz zorunluluğu yok)
+            // bir alan (field) her zaman bir property olmayabilir; VB.NET veya hızlıca yazılmış
+            // C# kodunda düz "public/private int X;" gibi ALAN'lar oldukça yaygın. DynamicEntityAccessor
+            // başlangıçta sadece ORM materialization (hep property'li POCO'lar) için tasarlandığından
+            // bu yol yoktu - burada FALLBACK olarak ekleniyor.
+            var field = type.GetField(propertyName, flags);
+            if (field != null)
+            {
+                var instanceParamF = Expression.Parameter(typeof(object), "instance");
+                var typedInstanceF = Expression.Convert(instanceParamF, type);
+                var fieldAccess = Expression.Field(typedInstanceF, field);
+
+                Expression bodyF = field.FieldType == typeof(TValue)
+                    ? fieldAccess
+                    : Expression.Convert(fieldAccess, typeof(TValue));
+
+                return Expression.Lambda<Func<object, TValue>>(bodyF, instanceParamF).Compile();
+            }
+
+            throw new MissingMemberException(type.Name, propertyName);
         }
 
-        private static Delegate BuildSetter<TValue>(Type type, string propertyName)
+        private static Delegate BuildSetter<TValue>(Type type, string propertyName, bool includeNonPublic = false)
         {
-            var property = type.GetProperty(propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly)
-                ?? throw new MissingMemberException(type.Name, propertyName);
-            var setMethod = property.GetSetMethod()
-                ?? throw new MissingMethodException(
-                    $"[DynamicEntityAccessor] '{propertyName}' için erişilebilir bir set metodu yok.");
+            var flags = MemberFlags(includeNonPublic);
+            var property = type.GetProperty(propertyName, flags);
+            if (property != null)
+            {
+                var setMethod = property.GetSetMethod(includeNonPublic)
+                    ?? throw new MissingMethodException(
+                        $"[DynamicEntityAccessor] '{propertyName}' için erişilebilir bir set metodu yok.");
 
-            var instanceParam = Expression.Parameter(typeof(object), "instance");
-            var valueParam = Expression.Parameter(typeof(TValue), "value");
-            var typedInstance = Expression.Convert(instanceParam, type);
+                var instanceParamP = Expression.Parameter(typeof(object), "instance");
+                var valueParamP = Expression.Parameter(typeof(TValue), "value");
+                var typedInstanceP = Expression.Convert(instanceParamP, type);
 
-            var paramType = setMethod.GetParameters()[0].ParameterType;
-            Expression valueExpr = paramType == typeof(TValue)
-                ? valueParam
-                : Expression.Convert(valueParam, paramType);
+                var paramType = setMethod.GetParameters()[0].ParameterType;
+                Expression valueExprP = paramType == typeof(TValue)
+                    ? valueParamP
+                    : Expression.Convert(valueParamP, paramType);
 
-            var call = Expression.Call(typedInstance, setMethod, valueExpr);
-            var lambda = Expression.Lambda<Action<object, TValue>>(call, instanceParam, valueParam);
-            return lambda.Compile();
+                var call = Expression.Call(typedInstanceP, setMethod, valueExprP);
+                return Expression.Lambda<Action<object, TValue>>(call, instanceParamP, valueParamP).Compile();
+            }
+
+            // Bkz. BuildGetter'daki aynı gerekçe: property yoksa alan (field) fallback'i.
+            var field = type.GetField(propertyName, flags);
+            if (field != null)
+            {
+                if (field.IsInitOnly || field.IsLiteral)
+                    throw new MissingMethodException(
+                        $"[DynamicEntityAccessor] '{propertyName}' alanı salt-okunur (readonly/const) - yazılamaz.");
+
+                var instanceParamF = Expression.Parameter(typeof(object), "instance");
+                var valueParamF = Expression.Parameter(typeof(TValue), "value");
+                var typedInstanceF = Expression.Convert(instanceParamF, type);
+                var fieldAccess = Expression.Field(typedInstanceF, field);
+
+                Expression valueExprF = field.FieldType == typeof(TValue)
+                    ? valueParamF
+                    : Expression.Convert(valueParamF, field.FieldType);
+
+                var assign = Expression.Assign(fieldAccess, valueExprF);
+                return Expression.Lambda<Action<object, TValue>>(assign, instanceParamF, valueParamF).Compile();
+            }
+
+            throw new MissingMemberException(type.Name, propertyName);
         }
     }
 }
