@@ -118,5 +118,11 @@ namespace DSO.Core.Evoker.TestApi.Controllers
         {
             ExtensionPointTests.RunAll();
         }
+
+        [HttpGet("Test10BuilderFeatureTests")]
+        public void Test10BuilderFeatureTests()
+        {
+            BuilderFeatureTests.RunAll();
+        }
     }
 }

@@ -67,6 +67,7 @@ namespace DSO.Core.Evoker
         {
             if (builder == null) throw new ArgumentNullException(nameof(builder));
             DynamicEntityAccessor.ForgetType(builder.Type);
+            EvokerBuilder.ForgetType(builder.Type); // metot delegate'leri de (unload için şart)
         }
 
         private static object RequireInstance(EvokerBuilder builder)

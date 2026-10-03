@@ -89,7 +89,7 @@ namespace DSO.Core.Evoker
         // örnekleri (farklı SetInstance/SetConstructor ile) birbirinin sonucunu ezmiyor.
         public Func<object[], TReturn> GetFunc<TReturn>(string methodName, object[]? sampleArgs = null)
         {
-            string cacheKey = BuildCacheKey(methodName, "Func", typeof(TReturn).Name, sampleArgs);
+            var cacheKey = BuildCacheKey(methodName, "Func", typeof(TReturn), sampleArgs);
 
             var cached = Cache.GetOrAdd(cacheKey, _ => BuildCachedFunc<TReturn>(methodName, sampleArgs));
             var typedInvoker = (Func<object?, object[], TReturn>)cached.Invoker;
@@ -103,7 +103,7 @@ namespace DSO.Core.Evoker
 
         public Action<object[]> GetAction(string methodName, object[]? sampleArgs = null)
         {
-            string cacheKey = BuildCacheKey(methodName, "Action", "void", sampleArgs);
+            var cacheKey = BuildCacheKey(methodName, "Action", typeof(void), sampleArgs);
 
             var cached = Cache.GetOrAdd(cacheKey, _ => BuildCachedAction(methodName, sampleArgs));
             var typedInvoker = (Action<object?, object[]>)cached.Invoker;
@@ -115,31 +115,34 @@ namespace DSO.Core.Evoker
             };
         }
 
-        private string BuildCacheKey(string methodName, string kind, string returnTypeName, object[]? sampleArgs)
+        // Cache anahtarı: (plugin/hedef Type NESNESİ, metot adı, tür, dönüş Type NESNESİ, argüman tip kimlikleri, NonPublic).
+        //
+        // ÖNEMLİ DÜZELTME: eskiden anahtar tamamen string'di ve tip kimliği AssemblyQualifiedName ile,
+        // dönüş/argüman tipleri de sadece .Name ile tutuluyordu. Bu iki durumda YANLIŞ delegate döndürüyordu:
+        //   1) Aynı DLL iki ayrı AssemblyLoadContext'e yüklendiğinde (ya da unload edilip yeni sürümü
+        //      yüklendiğinde) iki FARKLI Type aynı AssemblyQualifiedName'e sahip olur -> birinin derlenmiş
+        //      delegate'i diğerinin nesnesiyle çağrılıp InvalidCastException ("[A]X cannot be cast to [B]X").
+        //   2) Farklı namespace'te aynı isimli tipler (A.Result / B.Result) dönüş ya da argüman tipi olarak
+        //      aynı anahtara düşerdi.
+        // Type nesneleri referans eşitliğiyle karşılaştırılır - Reflection.Emit'in dinamik tipleri
+        // (DynamicTypeFactory, eski AQN gerekçesi) için de doğru ve tekil.
+        private CacheKey BuildCacheKey(string methodName, string kind, Type returnType, object[]? sampleArgs)
         {
-            // _type.FullName YERİNE AssemblyQualifiedName kullanılıyor:
-            // Reflection.Emit ile üretilen dinamik tipler (bkz. DynamicTypeFactory) aynı isme
-            // ("DynamicCustomer" gibi) sahip ama BAMBAŞKA Type nesneleri olabilir. FullName bu
-            // durumda çakışıp yanlış (önceki tipe ait) delegate'in cache'ten dönmesine sebep olurdu.
-            // AssemblyQualifiedName, dinamik assembly adının içindeki GUID sayesinde tekil kalır.
-            string typeIdentity = _type.AssemblyQualifiedName ?? _type.FullName ?? _type.Name;
-
-            // Argüman TİPLERİ de anahtara dahil ediliyor (sadece sayı değil): aksi halde
-            // Calc(int,int) ve Calc(string,string) gibi aynı isim + aynı parametre sayısına
-            // sahip overload'lar aynı cache key'i paylaşıp birbirinin delegate'ini çalıştırırdı.
             string argSignature = sampleArgs == null
                 ? "null"
-                : string.Join(",", sampleArgs.Select(a => a?.GetType().Name ?? "null"));
+                : string.Join(",", sampleArgs.Select(a => a == null ? "null" : a.GetType().TypeHandle.Value.ToString("x")));
 
-            return $"{typeIdentity}.{methodName}:{kind}<{returnTypeName}>:ArgTypes=({argSignature}):NonPublic={_includeNonPublic}";
+            return new CacheKey(_type, methodName, kind, returnType, argSignature, _includeNonPublic);
         }
+
+        private readonly record struct CacheKey(Type Type, string Method, string Kind, Type ReturnType, string ArgSignature, bool NonPublic);
 
         private CachedMethod BuildCachedFunc<TReturn>(string methodName, object[]? sampleArgs)
         {
             var methodInfo = GetMethodInfo(methodName, sampleArgs);
             var instanceParam = Expression.Parameter(typeof(object), "instance");
             var argsParam = Expression.Parameter(typeof(object[]), "args");
-            var call = BuildCallExpression(methodInfo, instanceParam, argsParam);
+            var call = BuildCallExpression(methodInfo, instanceParam, argsParam, sampleArgs?.Length ?? methodInfo.GetParameters().Length);
 
             Expression body = call;
             if (methodInfo.ReturnType != typeof(void) && methodInfo.ReturnType != typeof(TReturn))
@@ -160,51 +163,105 @@ namespace DSO.Core.Evoker
             var methodInfo = GetMethodInfo(methodName, sampleArgs);
             var instanceParam = Expression.Parameter(typeof(object), "instance");
             var argsParam = Expression.Parameter(typeof(object[]), "args");
-            var call = BuildCallExpression(methodInfo, instanceParam, argsParam);
+            var call = BuildCallExpression(methodInfo, instanceParam, argsParam, sampleArgs?.Length ?? methodInfo.GetParameters().Length);
 
             var lambda = Expression.Lambda<Action<object?, object[]>>(call, instanceParam, argsParam);
             return new CachedMethod(lambda.Compile(), methodInfo.IsStatic);
         }
 
-        private MethodInfo GetMethodInfo(string methodName, object[]? sampleArgs)
+        private MethodInfo GetMethodInfo(string methodName, object[]? sampleArgs) => FindMethod(methodName, sampleArgs);
+
+        /// <summary>
+        /// Invoke/Execute/GetFunc'ın kullandığı metot seçimi - dışarıdan da (ör. DSO.Core.Evoker.Plugins'in
+        /// dönüş şeklini önceden bilmesi gereken katmanları) AYNI kuralla çözebilsin diye public.
+        /// Kurallar:
+        ///   1) İsim önce birebir (Ordinal) aranır; hiç yoksa büyük/küçük harf DUYARSIZ aranır (VB.NET
+        ///      case-insensitive bir dil - "add" ile "Add" çağrılabilir).
+        ///   2) sampleArgs null ise ilk aday döner (eski davranış).
+        ///   3) Parametre sayısı argüman sayısına EŞİT adaylar önceliklidir; yoksa, argüman sayısından
+        ///      FAZLA parametresi olup fazlalıkların HEPSİ optional olan adaylar (VB.NET "Optional",
+        ///      C# "= varsayılan") kullanılır - eksik argümanlar çağrıda metodun varsayılanlarıyla doldurulur.
+        ///   4) Birden fazla aday varsa argüman tiplerine göre: önce birebir tip, sonra atanabilir tip.
+        /// Uygun aday yoksa MissingMethodException (mevcut imzaları listeleyerek).
+        /// </summary>
+        public MethodInfo FindMethod(string methodName, object?[]? sampleArgs)
+        {
+            if (string.IsNullOrWhiteSpace(methodName))
+                throw new ArgumentException("methodName boş olamaz.", nameof(methodName));
+
+            var methods = MethodsNamed(methodName);
+            if (methods.Count == 0)
+                throw new MissingMethodException($"[EvokerEngine] '{_type.Name}' üzerinde '{methodName}' metodu bulunamadı.");
+
+            if (sampleArgs == null)
+                return methods[0];
+
+            int n = sampleArgs.Length;
+            var candidates = CandidatesFor(methods, n);
+
+            if (candidates.Count == 0)
+            {
+                var sigs = string.Join("; ", methods.Select(m =>
+                    $"{m.Name}({string.Join(", ", m.GetParameters().Select(p => (p.IsOptional ? "[opt] " : "") + p.ParameterType.Name))})"));
+                throw new MissingMethodException(
+                    $"[EvokerEngine] '{_type.Name}.{methodName}' için {n} argümanla çağrılabilen bir overload yok. Mevcut: {sigs}");
+            }
+
+            if (candidates.Count == 1)
+                return candidates[0];
+
+            var exactMatch = candidates.FirstOrDefault(m => MatchesArgTypes(m, sampleArgs, exact: true));
+            if (exactMatch != null) return exactMatch;
+
+            var compatibleMatch = candidates.FirstOrDefault(m => MatchesArgTypes(m, sampleArgs, exact: false));
+            if (compatibleMatch != null) return compatibleMatch;
+
+            return candidates[0];
+        }
+
+        /// <summary>
+        /// FindMethod'un 1. ve 3. kuralına göre n argümanla çağrılabilecek adaylar (tip bakılmadan): önce
+        /// parametre sayısı birebir n olanlar, yoksa fazlası optional olanlar. Argüman DEĞERLERİ elde
+        /// olmadan (ör. sadece sayısı biliniyorsa) aynı kuralla ön-eleme yapmak isteyen katmanlar için.
+        /// </summary>
+        public IReadOnlyList<MethodInfo> FindMethodCandidates(string methodName, int argCount) =>
+            CandidatesFor(MethodsNamed(methodName), argCount);
+
+        private List<MethodInfo> MethodsNamed(string methodName)
         {
             var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
             if (_includeNonPublic) flags |= BindingFlags.NonPublic;
 
-            var methods = _type.GetMethods(flags).Where(m => m.Name == methodName).ToList();
-
-            if (!methods.Any())
-                throw new MissingMethodException($"[EvokerEngine] '{_type.Name}' üzerinde '{methodName}' metodu bulunamadı.");
-
-            if (sampleArgs == null)
-                return methods.First();
-
-            var candidatesByCount = methods.Where(m => m.GetParameters().Length == sampleArgs.Length).ToList();
-
-            if (candidatesByCount.Count == 0)
-                return methods.First(); // eski davranışla uyumluluk için fallback
-
-            if (candidatesByCount.Count == 1)
-                return candidatesByCount[0];
-
-            // Birden fazla overload aynı parametre sayısına sahipse, argüman tiplerine göre
-            // en uygun eşleşmeyi bulmaya çalışıyoruz (eskiden sadece ilk bulunan seçiliyordu,
-            // bu da overload'lar arasında öngörülemez sonuçlara yol açabiliyordu).
-            var exactMatch = candidatesByCount.FirstOrDefault(m =>
-                MatchesArgTypes(m, sampleArgs, exact: true));
-            if (exactMatch != null) return exactMatch;
-
-            var compatibleMatch = candidatesByCount.FirstOrDefault(m =>
-                MatchesArgTypes(m, sampleArgs, exact: false));
-            if (compatibleMatch != null) return compatibleMatch;
-
-            return candidatesByCount[0];
+            var all = _type.GetMethods(flags);
+            var methods = all.Where(m => m.Name == methodName).ToList();
+            if (methods.Count == 0)
+                methods = all.Where(m => string.Equals(m.Name, methodName, StringComparison.OrdinalIgnoreCase)).ToList();
+            return methods;
         }
 
-        private static bool MatchesArgTypes(MethodInfo method, object[] sampleArgs, bool exact)
+        private static List<MethodInfo> CandidatesFor(List<MethodInfo> methods, int n)
+        {
+            var exact = methods.Where(m => m.GetParameters().Length == n).ToList();
+            return exact.Count > 0
+                ? exact
+                : methods.Where(m => AcceptsArgCount(m, n)).OrderBy(m => m.GetParameters().Length).ToList();
+        }
+
+        /// <summary>Metot n argümanla çağrılabilir mi: n &lt;= parametre sayısı ve n'den sonraki parametrelerin hepsi optional.</summary>
+        public static bool AcceptsArgCount(MethodInfo method, int n)
+        {
+            var ps = method.GetParameters();
+            if (n > ps.Length) return false;
+            for (int i = n; i < ps.Length; i++)
+                if (!ps[i].IsOptional) return false;
+            return true;
+        }
+
+        private static bool MatchesArgTypes(MethodInfo method, object?[] sampleArgs, bool exact)
         {
             var parameters = method.GetParameters();
-            for (int i = 0; i < parameters.Length; i++)
+            // Sadece VERİLEN argümanlar karşılaştırılır - geri kalan parametreler optional (varsayılanla dolacak).
+            for (int i = 0; i < sampleArgs.Length && i < parameters.Length; i++)
             {
                 var paramType = parameters[i].ParameterType;
                 if (paramType.IsByRef) paramType = paramType.GetElementType()!;
@@ -229,7 +286,7 @@ namespace DSO.Core.Evoker
             return true;
         }
 
-        private static MethodCallExpression BuildCallExpression(MethodInfo methodInfo, ParameterExpression instanceParam, ParameterExpression argsParam)
+        private static MethodCallExpression BuildCallExpression(MethodInfo methodInfo, ParameterExpression instanceParam, ParameterExpression argsParam, int suppliedCount)
         {
             var parameters = methodInfo.GetParameters();
             var convertedArgs = new Expression[parameters.Length];
@@ -255,6 +312,13 @@ namespace DSO.Core.Evoker
                         "slotlarını doğru şekilde günceller.");
                 }
 
+                if (i >= suppliedCount)
+                {
+                    // Verilmemiş optional parametre (bkz. FindMethod kural 3) - metodun kendi varsayılanı.
+                    convertedArgs[i] = DefaultValueExpression(parameters[i]);
+                    continue;
+                }
+
                 var arrayAccess = Expression.ArrayIndex(argsParam, Expression.Constant(i));
                 convertedArgs[i] = Expression.Convert(arrayAccess, paramType);
             }
@@ -269,6 +333,19 @@ namespace DSO.Core.Evoker
             }
 
             return Expression.Call(instance, methodInfo, convertedArgs);
+        }
+
+        // Optional parametrenin varsayılan değeri. DefaultValue null/DBNull ise (ör. "= null", "= default",
+        // ya da sadece [Optional] işaretli) default(T); enum varsayılanları metadata'da alttaki sayı olarak
+        // durur, Convert ile enum'a çevrilir. decimal/DateTime varsayılanları (Decimal/DateTimeConstant
+        // attribute'ları) ParameterInfo.DefaultValue tarafından zaten doğru okunur.
+        private static Expression DefaultValueExpression(ParameterInfo p)
+        {
+            var t = p.ParameterType;
+            object? dv = p.HasDefaultValue ? p.DefaultValue : null;
+            if (dv == null || dv is DBNull || dv == Type.Missing)
+                return Expression.Default(t);
+            return Expression.Convert(Expression.Constant(dv, dv.GetType()), t);
         }
 
         // Instance her ÇAĞRIDA (cache'in dışında) burada çözülüyor:
@@ -313,6 +390,22 @@ namespace DSO.Core.Evoker
             }
         }
 
-        private static readonly ConcurrentDictionary<string, CachedMethod> Cache = new();
+        private static readonly ConcurrentDictionary<CacheKey, CachedMethod> Cache = new();
+
+        /// <summary>
+        /// Bu tipe ait TÜM derlenmiş delegate'leri statik cache'ten çıkarır. Bir plugin'in
+        /// AssemblyLoadContext'i unload edilecekse ŞART: cache'teki delegate'ler plugin tiplerine güçlü
+        /// referans tutar ve context'in bellekten atılmasını engeller.
+        /// </summary>
+        public static void ForgetType(Type type)
+        {
+            if (type == null) throw new ArgumentNullException(nameof(type));
+            foreach (var key in Cache.Keys)
+                if (key.Type == type || key.ReturnType == type)
+                    Cache.TryRemove(key, out _);
+        }
+
+        /// <summary>Statik cache'te bu tipe ait kaç derlenmiş delegate var (tanılama/test).</summary>
+        public static int CachedCountFor(Type type) => Cache.Keys.Count(k => k.Type == type);
     }
 }

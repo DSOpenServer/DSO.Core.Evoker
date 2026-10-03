@@ -67,12 +67,28 @@ namespace DSO.Core.Evoker
 
             foreach (var key in AccessorCache.Keys)
             {
-                if (key.Type == type)
+                if (key.Type == type || key.ValueType == type)
                 {
                     AccessorCache.TryRemove(key, out _);
                 }
             }
+
+            // FIFO tahliye kuyruğu da anahtarları (dolayısıyla Type'ı) tutuyor - sadece cache'ten silmek
+            // YETMEZ: kuyrukta kalan anahtar Type'a güçlü referans olarak kalır ve (plugin senaryosunda)
+            // tipin AssemblyLoadContext'inin unload edilmesini ENGELLER. Kuyruk bu tip hariç yeniden kurulur.
+            // (ForgetType nadir çağrılır - kuyruğu baştan kurmanın maliyeti önemsiz.)
+            lock (InsertionOrderRebuildLock)
+            {
+                int count = AccessorInsertionOrder.Count;
+                for (int i = 0; i < count && AccessorInsertionOrder.TryDequeue(out var k); i++)
+                {
+                    if (k.Type != type && k.ValueType != type)
+                        AccessorInsertionOrder.Enqueue(k);
+                }
+            }
         }
+
+        private static readonly object InsertionOrderRebuildLock = new();
 
         /// <summary>
         /// Parametresiz constructor'ı DERLENMİŞ bir delegate olarak döner. Activator.CreateInstance
@@ -241,6 +257,21 @@ namespace DSO.Core.Evoker
             BaseMemberFlags | System.Reflection.BindingFlags.Public
             | (includeNonPublic ? System.Reflection.BindingFlags.NonPublic : 0);
 
+        // VB.NET case-insensitive: birebir isim bulunamazsa büyük/küçük harf duyarsız TEK bir eşleşme
+        // aranır. Birden fazla eşleşme varsa (C#'ta "Name" ve "NAME" ayrı üyeler olabilir) belirsizliği
+        // tahminle çözmüyoruz - bulunamadı sayılır (birebir isim zaten önce denendi).
+        private static T? FindIgnoreCase<T>(T[] members, string name) where T : MemberInfo
+        {
+            T? found = null;
+            foreach (var m in members)
+            {
+                if (!string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) continue;
+                if (found != null) return null;
+                found = m;
+            }
+            return found;
+        }
+
         private static Delegate BuildGetter<TValue>(Type type, string propertyName, bool includeNonPublic = false)
         {
             // NOT: DeclaredOnly ZORUNLU. DSO.Core.Evoker.Extend ile bir base class'tan türetilen
@@ -251,7 +282,7 @@ namespace DSO.Core.Evoker
             // DeclaredOnly, sadece BİZİM emit ettiğimiz (type'ın kendi üzerinde tanımlı) property'yi
             // hedefler, ki zaten her zaman doğru olan budur.
             var flags = MemberFlags(includeNonPublic);
-            var property = type.GetProperty(propertyName, flags);
+            var property = type.GetProperty(propertyName, flags) ?? FindIgnoreCase(type.GetProperties(flags), propertyName);
             if (property != null)
             {
                 // includeNonPublic=true iken GetGetMethod(true) çağrılıyor - property PUBLIC olsa bile
@@ -279,7 +310,7 @@ namespace DSO.Core.Evoker
             // C# kodunda düz "public/private int X;" gibi ALAN'lar oldukça yaygın. DynamicEntityAccessor
             // başlangıçta sadece ORM materialization (hep property'li POCO'lar) için tasarlandığından
             // bu yol yoktu - burada FALLBACK olarak ekleniyor.
-            var field = type.GetField(propertyName, flags);
+            var field = type.GetField(propertyName, flags) ?? FindIgnoreCase(type.GetFields(flags), propertyName);
             if (field != null)
             {
                 var instanceParamF = Expression.Parameter(typeof(object), "instance");
@@ -299,7 +330,7 @@ namespace DSO.Core.Evoker
         private static Delegate BuildSetter<TValue>(Type type, string propertyName, bool includeNonPublic = false)
         {
             var flags = MemberFlags(includeNonPublic);
-            var property = type.GetProperty(propertyName, flags);
+            var property = type.GetProperty(propertyName, flags) ?? FindIgnoreCase(type.GetProperties(flags), propertyName);
             if (property != null)
             {
                 var setMethod = property.GetSetMethod(includeNonPublic)
@@ -320,7 +351,7 @@ namespace DSO.Core.Evoker
             }
 
             // Bkz. BuildGetter'daki aynı gerekçe: property yoksa alan (field) fallback'i.
-            var field = type.GetField(propertyName, flags);
+            var field = type.GetField(propertyName, flags) ?? FindIgnoreCase(type.GetFields(flags), propertyName);
             if (field != null)
             {
                 if (field.IsInitOnly || field.IsLiteral)

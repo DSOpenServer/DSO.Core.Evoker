@@ -837,4 +837,96 @@ namespace DSO.Core.Evoker.TestApi
             Console.WriteLine(failures == 0 ? "TÜM EXTENSION POINT TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
         }
     }
+
+    public enum FeatLevel { A = 1, B = 2, C = 3 }
+    public delegate void TripleHandler(int a, string b, double c);
+
+    public class FeatTarget
+    {
+        public string Name { get; set; } = "ilk";
+
+        // VB.NET "Optional" ile aynı metadata (C# varsayılanlı parametre)
+        public string Opt(int a, int b = 5, string s = "x", FeatLevel lv = FeatLevel.B, decimal d = 1.5m, DateTime? dt = null)
+            => $"{a}|{b}|{s}|{lv}|{d}|{(dt.HasValue ? "dt" : "null")}";
+
+        public int Over(int a) => 1;
+        public int Over(int a, int b = 0) => 2;
+
+        public event EventHandler<int>? ValueChanged;
+        public event TripleHandler? Triple;
+        public static event EventHandler? StaticPing;
+        private event EventHandler? HiddenEvent;
+
+        public void RaiseValue(int v) => ValueChanged?.Invoke(this, v);
+        public void RaiseTriple() => Triple?.Invoke(7, "yedi", 7.5);
+        public static void RaiseStatic() => StaticPing?.Invoke(null, EventArgs.Empty);
+        public void RaiseHidden() => HiddenEvent?.Invoke(this, EventArgs.Empty);
+        public bool HasValueSubscribers => ValueChanged != null;
+    }
+
+    public static class BuilderFeatureTests
+    {
+        private static int _fail;
+        private static void Check(string label, bool ok, string detail = "")
+        {
+            Console.WriteLine($"  [{(ok ? "OK" : "HATA")}]   {label}{(detail.Length > 0 ? " -> " + detail : "")}");
+            if (!ok) _fail++;
+        }
+
+        public static void RunAll()
+        {
+            var t = new FeatTarget();
+            var b = new EvokerBuilder(typeof(FeatTarget)).SetInstance(t);
+
+            Console.WriteLine("=== TEST F1: Optional parametreler (VB.NET Optional) ===");
+            Check("Opt(1) -> tüm varsayılanlar", b.Invoke<string>("Opt", 1) == "1|5|x|B|1,5|null", b.Invoke<string>("Opt", 1)!);
+            Check("Opt(1,2) -> kalanı varsayılan", b.Invoke<string>("Opt", 1, 2) == "1|2|x|B|1,5|null");
+            Check("Opt(1,2,\"y\")", b.Invoke<string>("Opt", 1, 2, "y") == "1|2|y|B|1,5|null");
+            Check("GetFunc(sampleArgs 1 eleman) varsayılanlarla", b.GetFunc<string>("Opt", new object[] { 0 })(new object[] { 9 }) == "9|5|x|B|1,5|null");
+            Check("Over(1) -> birebir sayı eşleşmesi önce (1)", b.Invoke<int>("Over", 1) == 1);
+            Check("Over(1,2) -> 2", b.Invoke<int>("Over", 1, 2) == 2);
+            try { b.Invoke("Opt"); Check("Opt() zorunlu parametresiz -> hata", false); }
+            catch (MissingMethodException ex) { Check("Opt() zorunlu parametresiz -> MissingMethodException", ex.Message.Contains("overload")); }
+
+            Console.WriteLine("=== TEST F2: Büyük/küçük harf duyarsız (VB.NET) ===");
+            Check("Invoke(\"opt\") küçük harf", b.Invoke<string>("opt", 3)!.StartsWith("3|"));
+            Check("GetValue(\"name\") küçük harf", b.GetValue<string>("name") == "ilk");
+            b.SetValue("NAME", "yeni");
+            Check("SetValue(\"NAME\") büyük harf", t.Name == "yeni");
+
+            Console.WriteLine("=== TEST F3: Event'ler ===");
+            int got = -1;
+            var sub = b.AddEventHandler("ValueChanged", a => got = (int)a[1]!);
+            t.RaiseValue(42);
+            Check("EventHandler<int> -> 42", got == 42);
+            sub.Dispose();
+            Check("Dispose -> abonelik kalktı", !t.HasValueSubscribers);
+            got = -1; t.RaiseValue(1);
+            Check("Dispose sonrası handler çağrılmadı", got == -1);
+
+            object?[]? triple = null;
+            using (b.AddEventHandler("triple", a => triple = a)) t.RaiseTriple();
+            Check("özel delegate (3 param) + küçük harf isim", triple != null && (int)triple[0]! == 7 && (string)triple[1]! == "yedi" && (double)triple[2]! == 7.5);
+
+            bool pinged = false;
+            using (new EvokerBuilder(typeof(FeatTarget)).AddEventHandler("StaticPing", _ => pinged = true)) FeatTarget.RaiseStatic();
+            Check("static event (instance'sız builder)", pinged);
+
+            try { b.AddEventHandler("HiddenEvent", _ => { }); Check("private event varsayılan builder'da görünmemeli", false); }
+            catch (MissingMemberException) { Check("private event varsayılan builder'da görünmüyor", true); }
+            bool hidden = false;
+            using (new EvokerBuilder(typeof(FeatTarget), includeNonPublic: true).SetInstance(t).AddEventHandler("HiddenEvent", _ => hidden = true)) t.RaiseHidden();
+            Check("private event includeNonPublic:true", hidden);
+            Check("GetEventNames", b.GetEventNames().OrderBy(x => x).SequenceEqual(new[] { "StaticPing", "Triple", "ValueChanged" }), string.Join(",", b.GetEventNames()));
+
+            Console.WriteLine("=== TEST F4: ForgetType / ForgetCache (unload için cache temizliği) ===");
+            Check("Invoke'lardan sonra statik cache'te kayıt var", EvokerBuilder.CachedCountFor(typeof(FeatTarget)) > 0, EvokerBuilder.CachedCountFor(typeof(FeatTarget)).ToString());
+            b.ForgetCache();
+            Check("ForgetCache sonrası statik cache boş", EvokerBuilder.CachedCountFor(typeof(FeatTarget)) == 0);
+            Check("ForgetCache sonrası tekrar çalışıyor", b.Invoke<int>("Over", 5) == 1);
+
+            Console.WriteLine(_fail == 0 ? "\nTÜM BUILDER ÖZELLİK TESTLERİ GEÇTİ ✅" : $"\n{_fail} BUILDER ÖZELLİK TESTİ BAŞARISIZ ❌");
+            if (_fail > 0) Environment.ExitCode = 1;
+        }
+    }
 }
