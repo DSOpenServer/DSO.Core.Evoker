@@ -925,8 +925,24 @@ namespace DSO.Core.Evoker.TestApi
             Check("ForgetCache sonrası statik cache boş", EvokerBuilder.CachedCountFor(typeof(FeatTarget)) == 0);
             Check("ForgetCache sonrası tekrar çalışıyor", b.Invoke<int>("Over", 5) == 1);
 
+            Console.WriteLine("=== TEST F5: EvokerEngine.ResolveType ===");
+            Check("kısa ad (benzersiz): FeatTarget", EvokerEngine.ResolveType("FeatTarget") == typeof(FeatTarget));
+            Check("tam ad", EvokerEngine.ResolveType("DSO.Core.Evoker.TestApi.FeatTarget") == typeof(FeatTarget));
+            Check("tam ad büyük/küçük harf duyarsız", EvokerEngine.ResolveType("dso.core.evoker.TestApi.feattarget") == typeof(FeatTarget));
+            try { EvokerEngine.ResolveType("AmbigName"); Check("belirsiz kısa ad -> AmbiguousMatchException", false); }
+            catch (System.Reflection.AmbiguousMatchException ex) { Check("belirsiz kısa ad -> AmbiguousMatchException (sessizce rastgele seçmiyor)", ex.Message.Contains("Dup1.AmbigName") && ex.Message.Contains("Dup2.AmbigName")); }
+            Check("belirsizlik tam adla çözülüyor", EvokerEngine.ResolveType("DSO.Core.Evoker.TestApi.Dup2.AmbigName") == typeof(Dup2.AmbigName));
+            try { EvokerEngine.ResolveType("YokBoyleBirTip_123"); Check("olmayan tip -> TypeLoadException", false); }
+            catch (TypeLoadException) { Check("olmayan tip -> TypeLoadException", true); }
+            Check("EvokerEngine.Invoke kısa adla çalışıyor", (int)EvokerEngine.Invoke("FeatTarget", "Over", false, 5)! == 1);
+
             Console.WriteLine(_fail == 0 ? "\nTÜM BUILDER ÖZELLİK TESTLERİ GEÇTİ ✅" : $"\n{_fail} BUILDER ÖZELLİK TESTİ BAŞARISIZ ❌");
             if (_fail > 0) Environment.ExitCode = 1;
         }
     }
+
+    namespace Dup1 { public class AmbigName { } }
+    namespace Dup2 { public class AmbigName { } }
 }
+
+
