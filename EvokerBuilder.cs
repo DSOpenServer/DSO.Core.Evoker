@@ -50,35 +50,38 @@ namespace DSO.Core.Evoker
             return this;
         }
 
+        // --- Doğrudan çağrı (sıcak yol) ---
+        // PERFORMANS: Invoke/Execute artık GetFunc'ın döndürdüğü closure'ı ÜRETMİYOR ve cache anahtarı için
+        // string ÜRETMİYOR (bkz. ArgTypeKey). Derlenmiş invoker cache'ten (önce bu builder'ın son kullandığı
+        // girdi, yoksa global cache) alınıp doğrudan çağrılıyor. Davranış aynı: aynı metot seçimi, aynı
+        // instance çözümü (SetInstance / SetConstructor / her çağrıda yeni nesne).
         public object? Invoke(string methodName, params object[] args)
         {
-            var func = GetFunc<object>(methodName, args);
-            return func(args);
+            var cm = GetCachedFunc<object>(methodName, args);
+            return ((Func<object?, object[], object>)cm.Invoker)(cm.IsStatic ? null : ResolveInstance(), args);
         }
 
         public TReturn? Invoke<TReturn>(string methodName, params object[] args)
         {
-            var func = GetFunc<TReturn>(methodName, args);
-            return func(args);
+            var cm = GetCachedFunc<TReturn>(methodName, args);
+            return ((Func<object?, object[], TReturn>)cm.Invoker)(cm.IsStatic ? null : ResolveInstance(), args);
         }
 
         public void Execute(string methodName, params object[] args)
         {
-            var action = GetAction(methodName, args);
-            action(args);
+            var cm = GetCachedAction(methodName, args);
+            ((Action<object?, object[]>)cm.Invoker)(cm.IsStatic ? null : ResolveInstance(), args);
         }
 
         public async Task ExecuteAsync(string methodName, params object[] args)
         {
-            var func = GetFunc<Task>(methodName, args);
-            var task = func(args);
+            var task = Invoke<Task>(methodName, args);
             if (task != null) await task;
         }
 
         public async Task<TReturn?> InvokeAsync<TReturn>(string methodName, params object[] args)
         {
-            var func = GetFunc<Task<TReturn>>(methodName, args);
-            var task = func(args);
+            var task = Invoke<Task<TReturn>>(methodName, args);
             return task != null ? await task : default;
         }
 
@@ -89,33 +92,61 @@ namespace DSO.Core.Evoker
         // örnekleri (farklı SetInstance/SetConstructor ile) birbirinin sonucunu ezmiyor.
         public Func<object[], TReturn> GetFunc<TReturn>(string methodName, object[]? sampleArgs = null)
         {
-            var cacheKey = BuildCacheKey(methodName, "Func", typeof(TReturn), sampleArgs);
-
-            var cached = Cache.GetOrAdd(cacheKey, _ => BuildCachedFunc<TReturn>(methodName, sampleArgs));
+            var cached = GetCachedFunc<TReturn>(methodName, sampleArgs);
             var typedInvoker = (Func<object?, object[], TReturn>)cached.Invoker;
 
-            return args =>
-            {
-                object? instance = cached.IsStatic ? null : ResolveInstance();
-                return typedInvoker(instance, args);
-            };
+            if (cached.IsStatic) return args => typedInvoker(null, args);
+            var bound = _existingInstance;
+            if (bound != null) return args => typedInvoker(bound, args);
+            return args => typedInvoker(ResolveInstance(), args);
         }
 
         public Action<object[]> GetAction(string methodName, object[]? sampleArgs = null)
         {
-            var cacheKey = BuildCacheKey(methodName, "Action", typeof(void), sampleArgs);
-
-            var cached = Cache.GetOrAdd(cacheKey, _ => BuildCachedAction(methodName, sampleArgs));
+            var cached = GetCachedAction(methodName, sampleArgs);
             var typedInvoker = (Action<object?, object[]>)cached.Invoker;
 
-            return args =>
-            {
-                object? instance = cached.IsStatic ? null : ResolveInstance();
-                typedInvoker(instance, args);
-            };
+            if (cached.IsStatic) return args => typedInvoker(null, args);
+            var bound = _existingInstance;
+            if (bound != null) return args => typedInvoker(bound, args);
+            return args => typedInvoker(ResolveInstance(), args);
         }
 
-        // Cache anahtarı: (plugin/hedef Type NESNESİ, metot adı, tür, dönüş Type NESNESİ, argüman tip kimlikleri, NonPublic).
+        private const string KindFunc = "Func", KindAction = "Action", KindTypedFunc = "TFunc", KindTypedAction = "TAction";
+
+        private CachedMethod GetCachedFunc<TReturn>(string methodName, object[]? sampleArgs)
+        {
+            var key = new CacheKey(_type, methodName, KindFunc, typeof(TReturn), ArgTypeKey.From(sampleArgs), _includeNonPublic);
+            var last = _last;
+            if (last != null && last.Key.Equals(key)) return last.Method;
+            // static lambda + state: isabet durumunda closure ALLOCATION'ı olmasın.
+            var cm = Cache.GetOrAdd(key, static (k, st) => st.Self.BuildCachedFunc<TReturn>(k.Method, st.Args), (Self: this, Args: sampleArgs));
+            _last = new LastHit(key, cm);
+            return cm;
+        }
+
+        private CachedMethod GetCachedAction(string methodName, object[]? sampleArgs)
+        {
+            var key = new CacheKey(_type, methodName, KindAction, typeof(void), ArgTypeKey.From(sampleArgs), _includeNonPublic);
+            var last = _last;
+            if (last != null && last.Key.Equals(key)) return last.Method;
+            var cm = Cache.GetOrAdd(key, static (k, st) => st.Self.BuildCachedAction(k.Method, st.Args), (Self: this, Args: sampleArgs));
+            _last = new LastHit(key, cm);
+            return cm;
+        }
+
+        // Bu builder'ın EN SON kullandığı cache girdisi. Aynı builder üzerinden aynı metodu tekrar tekrar
+        // çağırmak (en yaygın kullanım) global sözlüğe hiç uğramaz. Tek referans atamasıyla değiştirildiği
+        // için thread-safe (yarış durumunda en kötü ihtimalle global cache'e düşülür).
+        private sealed class LastHit
+        {
+            public readonly CacheKey Key;
+            public readonly CachedMethod Method;
+            public LastHit(CacheKey key, CachedMethod method) { Key = key; Method = method; }
+        }
+        private LastHit? _last;
+
+        // Cache anahtarı: (plugin/hedef Type NESNESİ, metot adı, tür, dönüş Type NESNESİ, argüman tip imzası, NonPublic).
         //
         // ÖNEMLİ DÜZELTME: eskiden anahtar tamamen string'di ve tip kimliği AssemblyQualifiedName ile,
         // dönüş/argüman tipleri de sadece .Name ile tutuluyordu. Bu iki durumda YANLIŞ delegate döndürüyordu:
@@ -126,16 +157,8 @@ namespace DSO.Core.Evoker
         //      aynı anahtara düşerdi.
         // Type nesneleri referans eşitliğiyle karşılaştırılır - Reflection.Emit'in dinamik tipleri
         // (DynamicTypeFactory, eski AQN gerekçesi) için de doğru ve tekil.
-        private CacheKey BuildCacheKey(string methodName, string kind, Type returnType, object[]? sampleArgs)
-        {
-            string argSignature = sampleArgs == null
-                ? "null"
-                : string.Join(",", sampleArgs.Select(a => a == null ? "null" : a.GetType().TypeHandle.Value.ToString("x")));
-
-            return new CacheKey(_type, methodName, kind, returnType, argSignature, _includeNonPublic);
-        }
-
-        private readonly record struct CacheKey(Type Type, string Method, string Kind, Type ReturnType, string ArgSignature, bool NonPublic);
+        // PERFORMANS: argüman imzası artık string değil ArgTypeKey (4 argümana kadar allocation yok).
+        private readonly record struct CacheKey(Type Type, string Method, string Kind, Type ReturnType, ArgTypeKey Args, bool NonPublic);
 
         private CachedMethod BuildCachedFunc<TReturn>(string methodName, object[]? sampleArgs)
         {
@@ -169,6 +192,142 @@ namespace DSO.Core.Evoker
             return new CachedMethod(lambda.Compile(), methodInfo.IsStatic);
         }
 
+        // --- Tipli delegate'ler (object[] ve boxing YOK) ---
+        // GetFunc<TReturn>(name) object[] alır: her çağrıda dizi + değer tipleri için boxing. Sıkı döngüler
+        // için tipli sürümler: argüman ve dönüş tipleri derleme zamanında bilinir, derlenmiş delegate
+        // parametreleri DOĞRUDAN metoda geçirir. Overload seçimi T1..Tn tiplerine göre (FindMethod ile aynı
+        // kural); Tn metodun parametre tipinden farklıysa (ör. int -> long, türetilmiş -> taban) dönüşüm
+        // derlenir, mümkün değilse InvalidCastException. Optional parametreler verilmezse varsayılanla dolar.
+        // Instance: SetInstance verilmişse delegate'e bağlanır; verilmemişse her çağrıda (Invoke gibi) çözülür.
+
+        public Func<TResult> GetTypedFunc<TResult>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Func<object?, TResult>>(methodName, Type.EmptyTypes, typeof(TResult));
+            if (TryBind(st, out var o)) return () => inv(o);
+            return () => inv(ResolveInstance());
+        }
+
+        public Func<T1, TResult> GetTypedFunc<T1, TResult>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Func<object?, T1, TResult>>(methodName, new[] { typeof(T1) }, typeof(TResult));
+            if (TryBind(st, out var o)) return a => inv(o, a);
+            return a => inv(ResolveInstance(), a);
+        }
+
+        public Func<T1, T2, TResult> GetTypedFunc<T1, T2, TResult>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Func<object?, T1, T2, TResult>>(methodName, new[] { typeof(T1), typeof(T2) }, typeof(TResult));
+            if (TryBind(st, out var o)) return (a, b) => inv(o, a, b);
+            return (a, b) => inv(ResolveInstance(), a, b);
+        }
+
+        public Func<T1, T2, T3, TResult> GetTypedFunc<T1, T2, T3, TResult>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Func<object?, T1, T2, T3, TResult>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, typeof(TResult));
+            if (TryBind(st, out var o)) return (a, b, c) => inv(o, a, b, c);
+            return (a, b, c) => inv(ResolveInstance(), a, b, c);
+        }
+
+        public Func<T1, T2, T3, T4, TResult> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Func<object?, T1, T2, T3, T4, TResult>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, typeof(TResult));
+            if (TryBind(st, out var o)) return (a, b, c, d) => inv(o, a, b, c, d);
+            return (a, b, c, d) => inv(ResolveInstance(), a, b, c, d);
+        }
+
+        public Action GetTypedAction(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Action<object?>>(methodName, Type.EmptyTypes, null);
+            if (TryBind(st, out var o)) return () => inv(o);
+            return () => inv(ResolveInstance());
+        }
+
+        public Action<T1> GetTypedAction<T1>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Action<object?, T1>>(methodName, new[] { typeof(T1) }, null);
+            if (TryBind(st, out var o)) return a => inv(o, a);
+            return a => inv(ResolveInstance(), a);
+        }
+
+        public Action<T1, T2> GetTypedAction<T1, T2>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Action<object?, T1, T2>>(methodName, new[] { typeof(T1), typeof(T2) }, null);
+            if (TryBind(st, out var o)) return (a, b) => inv(o, a, b);
+            return (a, b) => inv(ResolveInstance(), a, b);
+        }
+
+        public Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Action<object?, T1, T2, T3>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, null);
+            if (TryBind(st, out var o)) return (a, b, c) => inv(o, a, b, c);
+            return (a, b, c) => inv(ResolveInstance(), a, b, c);
+        }
+
+        public Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName)
+        {
+            var (inv, st) = TypedInvoker<Action<object?, T1, T2, T3, T4>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, null);
+            if (TryBind(st, out var o)) return (a, b, c, d) => inv(o, a, b, c, d);
+            return (a, b, c, d) => inv(ResolveInstance(), a, b, c, d);
+        }
+
+        // Static metot -> instance null (bağlı); SetInstance varsa o nesne (bağlı); yoksa her çağrıda çözülür.
+        private bool TryBind(bool isStatic, out object? instance)
+        {
+            instance = isStatic ? null : _existingInstance;
+            return isStatic || instance != null;
+        }
+
+        private (TDelegate Invoker, bool IsStatic) TypedInvoker<TDelegate>(string methodName, Type[] argTypes, Type? resultType)
+            where TDelegate : Delegate
+        {
+            var key = new CacheKey(_type, methodName, resultType == null ? KindTypedAction : KindTypedFunc,
+                resultType ?? typeof(void), ArgTypeKey.FromTypes(argTypes), _includeNonPublic);
+            var cm = Cache.GetOrAdd(key, k => BuildTyped(typeof(TDelegate), k.Method, argTypes, resultType));
+            return ((TDelegate)cm.Invoker, cm.IsStatic);
+        }
+
+        private CachedMethod BuildTyped(Type delegateType, string methodName, Type[] argTypes, Type? resultType)
+        {
+            var methodInfo = FindMethodByTypes(methodName, argTypes);
+            var parameters = methodInfo.GetParameters();
+            var instanceParam = Expression.Parameter(typeof(object), "instance");
+            var argParams = argTypes.Select((t, i) => Expression.Parameter(t, "a" + i)).ToArray();
+
+            var callArgs = new Expression[parameters.Length];
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                var pt = parameters[i].ParameterType;
+                if (pt.IsByRef)
+                    throw new NotSupportedException($"[EvokerBuilder] '{methodInfo.Name}' metodunun '{parameters[i].Name}' parametresi ref/out - tipli delegate ile desteklenmez.");
+                if (i >= argParams.Length) { callArgs[i] = DefaultValueExpression(parameters[i]); continue; }
+                callArgs[i] = ConvertOrThrow(argParams[i], pt, methodInfo, $"{i + 1}. argüman");
+            }
+
+            Expression? instance = methodInfo.IsStatic ? null : Expression.Convert(instanceParam, methodInfo.DeclaringType!);
+            Expression body = Expression.Call(instance, methodInfo, callArgs);
+
+            if (resultType != null)
+            {
+                if (methodInfo.ReturnType == typeof(void))
+                    throw new InvalidOperationException($"[EvokerBuilder] '{_type.Name}.{methodInfo.Name}' void döndürüyor - GetTypedAction kullanın.");
+                body = ConvertOrThrow(body, resultType, methodInfo, "dönüş değeri");
+            }
+
+            var lambda = Expression.Lambda(delegateType, body, new[] { instanceParam }.Concat(argParams));
+            return new CachedMethod(lambda.Compile(), methodInfo.IsStatic);
+        }
+
+        private Expression ConvertOrThrow(Expression e, Type to, MethodInfo m, string what)
+        {
+            if (e.Type == to) return e;
+            try { return Expression.Convert(e, to); }
+            catch (InvalidOperationException)
+            {
+                throw new InvalidCastException(
+                    $"[EvokerBuilder] '{_type.Name}.{m.Name}': {what} için '{e.Type.Name}' -> '{to.Name}' dönüşümü yok.");
+            }
+        }
+
         private MethodInfo GetMethodInfo(string methodName, object[]? sampleArgs) => FindMethod(methodName, sampleArgs);
 
         /// <summary>
@@ -186,6 +345,18 @@ namespace DSO.Core.Evoker
         /// </summary>
         public MethodInfo FindMethod(string methodName, object?[]? sampleArgs)
         {
+            if (sampleArgs == null) return FindMethodCore(methodName, null);
+            var types = new Type?[sampleArgs.Length];
+            for (int i = 0; i < types.Length; i++) types[i] = sampleArgs[i]?.GetType();
+            return FindMethodCore(methodName, types);
+        }
+
+        /// <summary>FindMethod ile aynı kural; argüman DEĞERLERİ yerine TİPLERİ verilir (null eleman = null argüman).</summary>
+        public MethodInfo FindMethodByTypes(string methodName, Type?[] argTypes)
+            => FindMethodCore(methodName, argTypes ?? throw new ArgumentNullException(nameof(argTypes)));
+
+        private MethodInfo FindMethodCore(string methodName, Type?[]? argTypes)
+        {
             if (string.IsNullOrWhiteSpace(methodName))
                 throw new ArgumentException("methodName boş olamaz.", nameof(methodName));
 
@@ -193,10 +364,10 @@ namespace DSO.Core.Evoker
             if (methods.Count == 0)
                 throw new MissingMethodException($"[EvokerEngine] '{_type.Name}' üzerinde '{methodName}' metodu bulunamadı.");
 
-            if (sampleArgs == null)
+            if (argTypes == null)
                 return methods[0];
 
-            int n = sampleArgs.Length;
+            int n = argTypes.Length;
             var candidates = CandidatesFor(methods, n);
 
             if (candidates.Count == 0)
@@ -210,10 +381,10 @@ namespace DSO.Core.Evoker
             if (candidates.Count == 1)
                 return candidates[0];
 
-            var exactMatch = candidates.FirstOrDefault(m => MatchesArgTypes(m, sampleArgs, exact: true));
+            var exactMatch = candidates.FirstOrDefault(m => MatchesArgTypes(m, argTypes, exact: true));
             if (exactMatch != null) return exactMatch;
 
-            var compatibleMatch = candidates.FirstOrDefault(m => MatchesArgTypes(m, sampleArgs, exact: false));
+            var compatibleMatch = candidates.FirstOrDefault(m => MatchesArgTypes(m, argTypes, exact: false));
             if (compatibleMatch != null) return compatibleMatch;
 
             return candidates[0];
@@ -257,17 +428,17 @@ namespace DSO.Core.Evoker
             return true;
         }
 
-        private static bool MatchesArgTypes(MethodInfo method, object?[] sampleArgs, bool exact)
+        private static bool MatchesArgTypes(MethodInfo method, Type?[] argTypes, bool exact)
         {
             var parameters = method.GetParameters();
             // Sadece VERİLEN argümanlar karşılaştırılır - geri kalan parametreler optional (varsayılanla dolacak).
-            for (int i = 0; i < sampleArgs.Length && i < parameters.Length; i++)
+            for (int i = 0; i < argTypes.Length && i < parameters.Length; i++)
             {
                 var paramType = parameters[i].ParameterType;
                 if (paramType.IsByRef) paramType = paramType.GetElementType()!;
 
-                var arg = sampleArgs[i];
-                if (arg == null)
+                var argType = argTypes[i];
+                if (argType == null)
                 {
                     if (paramType.IsValueType && Nullable.GetUnderlyingType(paramType) == null)
                         return false;
@@ -276,11 +447,11 @@ namespace DSO.Core.Evoker
 
                 if (exact)
                 {
-                    if (paramType != arg.GetType()) return false;
+                    if (paramType != argType) return false;
                 }
                 else
                 {
-                    if (!paramType.IsAssignableFrom(arg.GetType())) return false;
+                    if (!paramType.IsAssignableFrom(argType)) return false;
                 }
             }
             return true;
@@ -401,9 +572,15 @@ namespace DSO.Core.Evoker
         {
             if (type == null) throw new ArgumentNullException(nameof(type));
             foreach (var key in Cache.Keys)
-                if (key.Type == type || key.ReturnType == type)
+                if (key.Type == type || Involves(key.ReturnType, type) || key.Args.Involves(t => Involves(t, type)))
                     Cache.TryRemove(key, out _);
         }
+
+        // t, target'ın kendisi ya da onu (dizi elemanı / generic argüman olarak - ör. List<Point>, Task<Point>) içeriyor mu.
+        private static bool Involves(Type t, Type target) =>
+            t == target
+            || (t.HasElementType && Involves(t.GetElementType()!, target))
+            || (t.IsGenericType && !t.IsGenericTypeDefinition && t.GetGenericArguments().Any(g => Involves(g, target)));
 
         /// <summary>Statik cache'te bu tipe ait kaç derlenmiş delegate var (tanılama/test).</summary>
         public static int CachedCountFor(Type type) => Cache.Keys.Count(k => k.Type == type);

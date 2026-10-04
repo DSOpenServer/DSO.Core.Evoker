@@ -862,6 +862,26 @@ namespace DSO.Core.Evoker.TestApi
         public static void RaiseStatic() => StaticPing?.Invoke(null, EventArgs.Empty);
         public void RaiseHidden() => HiddenEvent?.Invoke(this, EventArgs.Empty);
         public bool HasValueSubscribers => ValueChanged != null;
+
+        // F7 (tipli delegate'ler)
+        public int Add(int a, int b) => a + b;
+        public long Wide(long x) => x * 2;
+        public static string Stat(string s) => "S:" + s;
+        public string Kind(object o) => "obj";
+        public string Kind(string s) => "str";
+        public int Hits;
+        public void Hit(int n) => Hits += n;
+        public string Base(FeatBase b) => b.GetType().Name;
+    }
+
+    public class FeatBase { }
+    public class FeatDerived : FeatBase { }
+
+    public class FeatFresh
+    {
+        // parametresiz ctor -> SetInstance yoksa her çağrıda YENİ nesne (Invoke ile aynı davranış)
+        private int _n;
+        public int Next() => ++_n;
     }
 
     public static class BuilderFeatureTests
@@ -936,6 +956,63 @@ namespace DSO.Core.Evoker.TestApi
             catch (TypeLoadException) { Check("olmayan tip -> TypeLoadException", true); }
             Check("EvokerEngine.Invoke kısa adla çalışıyor", (int)EvokerEngine.Invoke("FeatTarget", "Over", false, 5)! == 1);
 
+            Console.WriteLine("=== TEST F6: ResolveType bulunamayan ad cache'i ===");
+            var miss = "NegCacheTip_" + Guid.NewGuid().ToString("N");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try { EvokerEngine.ResolveType(miss); } catch (TypeLoadException) { }
+            var first = sw.Elapsed; sw.Restart();
+            bool threw = false;
+            try { EvokerEngine.ResolveType(miss); } catch (TypeLoadException) { threw = true; }
+            var second = sw.Elapsed;
+            Check("ikinci ıska yine TypeLoadException", threw);
+            Check("ikinci ıska taramıyor (çok daha hızlı)", second.Ticks * 5 < first.Ticks, $"ilk {first.TotalMilliseconds:0.00} ms, ikinci {second.TotalMilliseconds:0.000} ms");
+            // Yeni assembly yüklenince (burada dinamik assembly) aynı ad artık BULUNMALI - negatif cache geçersiz sayılır.
+            var ab = System.Reflection.Emit.AssemblyBuilder.DefineDynamicAssembly(new System.Reflection.AssemblyName("NegCacheAsm_" + Guid.NewGuid().ToString("N")), System.Reflection.Emit.AssemblyBuilderAccess.Run);
+            var tb = ab.DefineDynamicModule("m").DefineType(miss, System.Reflection.TypeAttributes.Public);
+            var created = tb.CreateType()!;
+            Type? found = null;
+            try { found = EvokerEngine.ResolveType(miss); } catch (TypeLoadException) { }
+            Check("yeni assembly yüklenince aynı ad bulunuyor", found == created);
+
+            Console.WriteLine("=== TEST F7: Tipli delegate'ler (GetTypedFunc / GetTypedAction - boxing yok) ===");
+            var add = b.GetTypedFunc<int, int, int>("Add");
+            Check("GetTypedFunc<int,int,int>(Add)", add(2, 3) == 5);
+            Check("argüman dönüşümü int -> long (Wide)", b.GetTypedFunc<int, long>("Wide")(21) == 42);
+            Check("dönüş dönüşümü long -> object", (long)b.GetTypedFunc<long, object>("Wide")(5L) == 10L);
+            Check("static metot", new EvokerBuilder(typeof(FeatTarget)).GetTypedFunc<string, string>("Stat")("x") == "S:x");
+            Check("overload tipe göre: string -> Kind(string)", b.GetTypedFunc<string, string>("Kind")("a") == "str");
+            Check("overload tipe göre: object -> Kind(object)", b.GetTypedFunc<object, string>("Kind")("a") == "obj");
+            Check("türetilmiş tip -> taban parametre", b.GetTypedFunc<FeatDerived, string>("Base")(new FeatDerived()) == "FeatDerived");
+            Check("optional parametreler varsayılanla (Opt(int))", b.GetTypedFunc<int, string>("Opt")(4) == "4|5|x|B|1,5|null");
+            Check("büyük/küçük harf duyarsız isim", b.GetTypedFunc<int, int, int>("add")(1, 1) == 2);
+            t.Hits = 0;
+            var hit = b.GetTypedAction<int>("Hit");
+            hit(3); hit(4);
+            Check("GetTypedAction<int>", t.Hits == 7);
+            var fresh = new EvokerBuilder(typeof(FeatFresh)).GetTypedFunc<int>("Next");
+            Check("SetInstance yok -> her çağrıda yeni nesne (Invoke ile aynı)", fresh() == 1 && fresh() == 1);
+            try { b.GetTypedFunc<string, int, int>("Add"); Check("uyumsuz argüman tipi -> hata", false); }
+            catch (MissingMethodException) { Check("uyumsuz argüman tipi -> hata", true); }
+            catch (InvalidCastException ex) { Check("uyumsuz argüman tipi -> InvalidCastException", ex.Message.Contains("String")); }
+            try { b.GetTypedFunc<int, int>("Hit"); Check("void metot GetTypedFunc -> hata", false); }
+            catch (InvalidOperationException ex) { Check("void metot GetTypedFunc -> açık hata", ex.Message.Contains("GetTypedAction")); }
+
+            Console.WriteLine("=== TEST F8: Invoke hızlı yolu - aynı builder'da farklı imzalar karışmıyor ===");
+            Check("Over(1) sonra Over(1,2) sonra Over(1)", b.Invoke<int>("Over", 1) == 1 && b.Invoke<int>("Over", 1, 2) == 2 && b.Invoke<int>("Over", 1) == 1);
+            Check("Kind(\"a\") / Kind(5) argüman tipine göre", b.Invoke<string>("Kind", "a") == "str" && b.Invoke<string>("Kind", 5) == "obj" && b.Invoke<string>("Kind", "b") == "str");
+            Check("Invoke<object> ile Invoke<int> aynı metot, farklı dönüş tipi", (int)b.Invoke<object>("Add", 1, 2)! == 3 && b.Invoke<int>("Add", 1, 2) == 3);
+            var other = new FeatTarget();
+            var b2 = new EvokerBuilder(typeof(FeatTarget)).SetInstance(other);
+            b2.Execute("Hit", 10); b.Execute("Hit", 1);
+            Check("iki builder farklı instance'lara gidiyor", other.Hits == 10 && t.Hits == 8, $"{other.Hits} / {t.Hits}");
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            var a5 = new object[] { 1, 2 };
+            for (int i = 0; i < 1000; i++) b.Invoke<int>("Add", a5);
+            long per = (GC.GetAllocatedBytesForCurrentThread() - before) / 1000;
+            Check("Invoke<int> çağrı başına allocation ~0 (sadece dönüş boxing'i olabilir)", per <= 32, per + " B");
+            b.ForgetCache();
+            Check("ForgetCache tipli/argüman tipli girdileri de siliyor", EvokerBuilder.CachedCountFor(typeof(FeatTarget)) == 0);
+
             Console.WriteLine(_fail == 0 ? "\nTÜM BUILDER ÖZELLİK TESTLERİ GEÇTİ ✅" : $"\n{_fail} BUILDER ÖZELLİK TESTİ BAŞARISIZ ❌");
             if (_fail > 0) Environment.ExitCode = 1;
         }
@@ -944,5 +1021,3 @@ namespace DSO.Core.Evoker.TestApi
     namespace Dup1 { public class AmbigName { } }
     namespace Dup2 { public class AmbigName { } }
 }
-
-

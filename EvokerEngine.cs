@@ -18,6 +18,18 @@ namespace DSO.Core.Evoker
         private static readonly ConcurrentDictionary<string, WeakReference<Type>> CollectibleCache = new(StringComparer.Ordinal);
         private static readonly ConditionalWeakTable<AssemblyLoadContext, object> HookedContexts = new();
 
+        // Bulunamayan adlar ("negatif cache"): ıska her seferinde TÜM assembly'lerin tüm tiplerini tarıyordu
+        // (ölçüm: ~13 ms). Yeni bir assembly yüklendiğinde (AssemblyLoad event'i) aranan tip artık var olabilir,
+        // bu yüzden liste tamamen boşaltılır. Sınırsız büyümesin diye (ör. kullanıcı girdisiyle rastgele adlar)
+        // MissCacheLimit'i aşınca da boşaltılır.
+        private static readonly ConcurrentDictionary<string, byte> MissCache = new(StringComparer.Ordinal);
+        private const int MissCacheLimit = 10_000;
+
+        static EvokerEngine()
+        {
+            AppDomain.CurrentDomain.AssemblyLoad += (_, _) => MissCache.Clear();
+        }
+
         /// <summary>
         /// İsimden tip çözer. Sıra: Type.GetType (assembly-qualified ad), sonra yüklü tüm assembly'lerde
         /// 1) FullName birebir, 2) FullName büyük/küçük harf duyarsız, 3) kısa ad birebir, 4) kısa ad duyarsız.
@@ -38,8 +50,17 @@ namespace DSO.Core.Evoker
                 return cached;
             if (CollectibleCache.TryGetValue(className, out var weak) && weak.TryGetTarget(out var live))
                 return live;
+            if (MissCache.ContainsKey(className))
+                throw NotFound(className);
 
-            var type = FindType(className);
+            Type type;
+            try { type = FindType(className); }
+            catch (TypeLoadException)
+            {
+                if (MissCache.Count >= MissCacheLimit) MissCache.Clear();
+                MissCache.TryAdd(className, 0);
+                throw;
+            }
             if (type.Assembly.IsCollectible)
                 CacheCollectible(className, type);
             else
@@ -47,11 +68,12 @@ namespace DSO.Core.Evoker
             return type;
         }
 
-        /// <summary>İsim cache'ini temizler (ör. yeni assembly'ler yüklendiyse ve kısa ad artık belirsizse).</summary>
+        /// <summary>İsim cache'lerini (bulunan + bulunamayan) temizler (ör. yeni assembly'ler yüklendiyse ve kısa ad artık belirsizse).</summary>
         public static void ClearTypeCache()
         {
             TypeCache.Clear();
             CollectibleCache.Clear();
+            MissCache.Clear();
         }
 
         private static void CacheCollectible(string name, Type type)
@@ -108,8 +130,10 @@ namespace DSO.Core.Evoker
                 }
             }
 
-            throw new TypeLoadException($"[EvokerEngine] '{name}' türü bulunamadı.");
+            throw NotFound(name);
         }
+
+        private static TypeLoadException NotFound(string name) => new($"[EvokerEngine] '{name}' türü bulunamadı.");
 
         // Kısmen yüklenebilen assembly (bir tipinin bağımlılığı eksik / karışık içerik): çözülebilen tipleri
         // kullan, assembly'yi tamamen düşürme. Dinamik/özel assembly'lerde GetTypes desteklenmezse boş geç.
