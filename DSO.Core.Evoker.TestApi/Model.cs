@@ -882,6 +882,7 @@ namespace DSO.Core.Evoker.TestApi
         // parametresiz ctor -> SetInstance yoksa her çağrıda YENİ nesne (Invoke ile aynı davranış)
         private int _n;
         public int Next() => ++_n;
+        public int NextBy(int k) => _n += k;
     }
 
     public static class BuilderFeatureTests
@@ -948,7 +949,7 @@ namespace DSO.Core.Evoker.TestApi
             Console.WriteLine("=== TEST F5: EvokerEngine.ResolveType ===");
             Check("kısa ad (benzersiz): FeatTarget", EvokerEngine.ResolveType("FeatTarget") == typeof(FeatTarget));
             Check("tam ad", EvokerEngine.ResolveType("DSO.Core.Evoker.TestApi.FeatTarget") == typeof(FeatTarget));
-            Check("tam ad büyük/küçük harf duyarsız", EvokerEngine.ResolveType("dso.core.evoker.TestApi.feattarget") == typeof(FeatTarget));
+            Check("tam ad büyük/küçük harf duyarsız", EvokerEngine.ResolveType("dso.core.evoker.testApi.feattarget") == typeof(FeatTarget));
             try { EvokerEngine.ResolveType("AmbigName"); Check("belirsiz kısa ad -> AmbiguousMatchException", false); }
             catch (System.Reflection.AmbiguousMatchException ex) { Check("belirsiz kısa ad -> AmbiguousMatchException (sessizce rastgele seçmiyor)", ex.Message.Contains("Dup1.AmbigName") && ex.Message.Contains("Dup2.AmbigName")); }
             Check("belirsizlik tam adla çözülüyor", EvokerEngine.ResolveType("DSO.Core.Evoker.TestApi.Dup2.AmbigName") == typeof(Dup2.AmbigName));
@@ -974,28 +975,33 @@ namespace DSO.Core.Evoker.TestApi
             try { found = EvokerEngine.ResolveType(miss); } catch (TypeLoadException) { }
             Check("yeni assembly yüklenince aynı ad bulunuyor", found == created);
 
-            Console.WriteLine("=== TEST F7: Tipli delegate'ler (GetTypedFunc / GetTypedAction - boxing yok) ===");
-            var add = b.GetTypedFunc<int, int, int>("Add");
-            Check("GetTypedFunc<int,int,int>(Add)", add(2, 3) == 5);
-            Check("argüman dönüşümü int -> long (Wide)", b.GetTypedFunc<int, long>("Wide")(21) == 42);
-            Check("dönüş dönüşümü long -> object", (long)b.GetTypedFunc<long, object>("Wide")(5L) == 10L);
-            Check("static metot", new EvokerBuilder(typeof(FeatTarget)).GetTypedFunc<string, string>("Stat")("x") == "S:x");
-            Check("overload tipe göre: string -> Kind(string)", b.GetTypedFunc<string, string>("Kind")("a") == "str");
-            Check("overload tipe göre: object -> Kind(object)", b.GetTypedFunc<object, string>("Kind")("a") == "obj");
-            Check("türetilmiş tip -> taban parametre", b.GetTypedFunc<FeatDerived, string>("Base")(new FeatDerived()) == "FeatDerived");
-            Check("optional parametreler varsayılanla (Opt(int))", b.GetTypedFunc<int, string>("Opt")(4) == "4|5|x|B|1,5|null");
-            Check("büyük/küçük harf duyarsız isim", b.GetTypedFunc<int, int, int>("add")(1, 1) == 2);
+            Console.WriteLine("=== TEST F7: Tipli delegate'ler (GetFunc / GetAction - boxing yok) ===");
+            var add = b.GetFunc<int, int, int>("Add");
+            Check("GetFunc<int,int,int>(Add)", add(2, 3) == 5);
+            Check("argüman dönüşümü int -> long (Wide)", b.GetFunc<int, long>("Wide")(21) == 42);
+            Check("dönüş dönüşümü long -> object", (long)b.GetFunc<long, object>("Wide")(5L) == 10L);
+            Check("static metot", new EvokerBuilder(typeof(FeatTarget)).GetFunc<string, string>("Stat")("x") == "S:x");
+            Check("overload tipe göre: string -> Kind(string)", b.GetFunc<string, string>("Kind")("a") == "str");
+            Check("overload tipe göre: object -> Kind(object)", b.GetFunc<object, string>("Kind")("a") == "obj");
+            Check("türetilmiş tip -> taban parametre", b.GetFunc<FeatDerived, string>("Base")(new FeatDerived()) == "FeatDerived");
+            Check("optional parametreler varsayılanla (Opt(int))", b.GetFunc<int, string>("Opt")(4) == "4|5|x|B|1,5|null");
+            Check("büyük/küçük harf duyarsız isim", b.GetFunc<int, int, int>("add")(1, 1) == 2);
             t.Hits = 0;
-            var hit = b.GetTypedAction<int>("Hit");
+            var hit = b.GetAction<int>("Hit");
             hit(3); hit(4);
-            Check("GetTypedAction<int>", t.Hits == 7);
-            var fresh = new EvokerBuilder(typeof(FeatFresh)).GetTypedFunc<int>("Next");
-            Check("SetInstance yok -> her çağrıda yeni nesne (Invoke ile aynı)", fresh() == 1 && fresh() == 1);
-            try { b.GetTypedFunc<string, int, int>("Add"); Check("uyumsuz argüman tipi -> hata", false); }
+            Check("GetAction<int>", t.Hits == 7);
+            var fresh = new EvokerBuilder(typeof(FeatFresh)).GetFunc<int, int>("NextBy");
+            Check("SetInstance yok -> her çağrıda yeni nesne (Invoke ile aynı)", fresh(1) == 1 && fresh(1) == 1);
+            // Aşırı yükleme ayrımı: tek tip parametreli GetFunc<int> ESKİ (object[] tabanlı) sürüm olarak kalmalı.
+            Func<object[], int> old = b.GetFunc<int>("Add", new object[] { 0, 0 });
+            Check("GetFunc<int>(ad, sampleArgs) eski object[] sürümü (aşırı yükleme karışmıyor)", old(new object[] { 2, 2 }) == 4);
+            Action<object[]> oldAct = b.GetAction("Hit");
+            Check("GetAction(ad) eski object[] sürümü", oldAct != null);
+            try { b.GetFunc<string, int, int>("Add"); Check("uyumsuz argüman tipi -> hata", false); }
             catch (MissingMethodException) { Check("uyumsuz argüman tipi -> hata", true); }
             catch (InvalidCastException ex) { Check("uyumsuz argüman tipi -> InvalidCastException", ex.Message.Contains("String")); }
-            try { b.GetTypedFunc<int, int>("Hit"); Check("void metot GetTypedFunc -> hata", false); }
-            catch (InvalidOperationException ex) { Check("void metot GetTypedFunc -> açık hata", ex.Message.Contains("GetTypedAction")); }
+            try { b.GetFunc<int, int>("Hit"); Check("void metot GetFunc -> hata", false); }
+            catch (InvalidOperationException ex) { Check("void metot GetFunc -> açık hata", ex.Message.Contains("GetAction")); }
 
             Console.WriteLine("=== TEST F8: Invoke hızlı yolu - aynı builder'da farklı imzalar karışmıyor ===");
             Check("Over(1) sonra Over(1,2) sonra Over(1)", b.Invoke<int>("Over", 1) == 1 && b.Invoke<int>("Over", 1, 2) == 2 && b.Invoke<int>("Over", 1) == 1);
@@ -1021,3 +1027,4 @@ namespace DSO.Core.Evoker.TestApi
     namespace Dup1 { public class AmbigName { } }
     namespace Dup2 { public class AmbigName { } }
 }
+ 

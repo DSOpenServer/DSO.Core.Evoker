@@ -200,70 +200,56 @@ namespace DSO.Core.Evoker
         // derlenir, mümkün değilse InvalidCastException. Optional parametreler verilmezse varsayılanla dolar.
         // Instance: SetInstance verilmişse delegate'e bağlanır; verilmemişse her çağrıda (Invoke gibi) çözülür.
 
-        public Func<TResult> GetTypedFunc<TResult>(string methodName)
-        {
-            var (inv, st) = TypedInvoker<Func<object?, TResult>>(methodName, Type.EmptyTypes, typeof(TResult));
-            if (TryBind(st, out var o)) return () => inv(o);
-            return () => inv(ResolveInstance());
-        }
-
-        public Func<T1, TResult> GetTypedFunc<T1, TResult>(string methodName)
+        public Func<T1, TResult> GetFunc<T1, TResult>(string methodName)
         {
             var (inv, st) = TypedInvoker<Func<object?, T1, TResult>>(methodName, new[] { typeof(T1) }, typeof(TResult));
             if (TryBind(st, out var o)) return a => inv(o, a);
             return a => inv(ResolveInstance(), a);
         }
 
-        public Func<T1, T2, TResult> GetTypedFunc<T1, T2, TResult>(string methodName)
+        public Func<T1, T2, TResult> GetFunc<T1, T2, TResult>(string methodName)
         {
             var (inv, st) = TypedInvoker<Func<object?, T1, T2, TResult>>(methodName, new[] { typeof(T1), typeof(T2) }, typeof(TResult));
             if (TryBind(st, out var o)) return (a, b) => inv(o, a, b);
             return (a, b) => inv(ResolveInstance(), a, b);
         }
 
-        public Func<T1, T2, T3, TResult> GetTypedFunc<T1, T2, T3, TResult>(string methodName)
+        public Func<T1, T2, T3, TResult> GetFunc<T1, T2, T3, TResult>(string methodName)
         {
             var (inv, st) = TypedInvoker<Func<object?, T1, T2, T3, TResult>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, typeof(TResult));
             if (TryBind(st, out var o)) return (a, b, c) => inv(o, a, b, c);
             return (a, b, c) => inv(ResolveInstance(), a, b, c);
         }
 
-        public Func<T1, T2, T3, T4, TResult> GetTypedFunc<T1, T2, T3, T4, TResult>(string methodName)
+        public Func<T1, T2, T3, T4, TResult> GetFunc<T1, T2, T3, T4, TResult>(string methodName)
         {
             var (inv, st) = TypedInvoker<Func<object?, T1, T2, T3, T4, TResult>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, typeof(TResult));
             if (TryBind(st, out var o)) return (a, b, c, d) => inv(o, a, b, c, d);
             return (a, b, c, d) => inv(ResolveInstance(), a, b, c, d);
         }
 
-        public Action GetTypedAction(string methodName)
-        {
-            var (inv, st) = TypedInvoker<Action<object?>>(methodName, Type.EmptyTypes, null);
-            if (TryBind(st, out var o)) return () => inv(o);
-            return () => inv(ResolveInstance());
-        }
-
-        public Action<T1> GetTypedAction<T1>(string methodName)
+        public Action<T1> GetAction<T1>(string methodName)
         {
             var (inv, st) = TypedInvoker<Action<object?, T1>>(methodName, new[] { typeof(T1) }, null);
             if (TryBind(st, out var o)) return a => inv(o, a);
             return a => inv(ResolveInstance(), a);
         }
 
-        public Action<T1, T2> GetTypedAction<T1, T2>(string methodName)
+        public Action<T1, T2> GetAction<T1, T2>(string methodName)
         {
             var (inv, st) = TypedInvoker<Action<object?, T1, T2>>(methodName, new[] { typeof(T1), typeof(T2) }, null);
             if (TryBind(st, out var o)) return (a, b) => inv(o, a, b);
             return (a, b) => inv(ResolveInstance(), a, b);
         }
 
-        public Action<T1, T2, T3> GetTypedAction<T1, T2, T3>(string methodName)
+        public Action<T1, T2, T3> GetAction<T1, T2, T3>(string methodName)
         {
             var (inv, st) = TypedInvoker<Action<object?, T1, T2, T3>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3) }, null);
             if (TryBind(st, out var o)) return (a, b, c) => inv(o, a, b, c);
             return (a, b, c) => inv(ResolveInstance(), a, b, c);
         }
 
-        public Action<T1, T2, T3, T4> GetTypedAction<T1, T2, T3, T4>(string methodName)
+        public Action<T1, T2, T3, T4> GetAction<T1, T2, T3, T4>(string methodName)
         {
             var (inv, st) = TypedInvoker<Action<object?, T1, T2, T3, T4>>(methodName, new[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, null);
             if (TryBind(st, out var o)) return (a, b, c, d) => inv(o, a, b, c, d);
@@ -309,7 +295,7 @@ namespace DSO.Core.Evoker
             if (resultType != null)
             {
                 if (methodInfo.ReturnType == typeof(void))
-                    throw new InvalidOperationException($"[EvokerBuilder] '{_type.Name}.{methodInfo.Name}' void döndürüyor - GetTypedAction kullanın.");
+                    throw new InvalidOperationException($"[EvokerBuilder] '{_type.Name}.{methodInfo.Name}' void döndürüyor - GetAction kullanın.");
                 body = ConvertOrThrow(body, resultType, methodInfo, "dönüş değeri");
             }
 

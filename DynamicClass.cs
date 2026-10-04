@@ -580,13 +580,18 @@ namespace DSO.Core.Evoker
                     // EvokerBuilder'ın cache'i (Type, Metot, DÖNÜŞ TİPİ) üzerinden anahtarlanıyor -
                     // ısınmanın işe yaraması için GERÇEK dönüş tipiyle ısıtmak gerekiyor, sabit
                     // <object> ile değil (aksi halde farklı bir cache girdisini ısıtmış oluruz).
-                    var getFunc = typeof(EvokerBuilder).GetMethod(nameof(EvokerBuilder.GetFunc))!.MakeGenericMethod(returnType);
+                    // NOT: GetFunc artık aşırı yüklü (tipli GetFunc<T1,...,TResult> sürümleri) - isimle aramak belirsiz olur;
+                    // tek tip parametreli (string, object[]) imzalı object[] tabanlı sürüm açıkça seçiliyor.
+                    var getFunc = ObjectArrayGetFunc.MakeGenericMethod(returnType);
                     getFunc.Invoke(builder, new object?[] { methodName, null });
                 }
             }
 
             return this;
         }
+
+        private static readonly MethodInfo ObjectArrayGetFunc = typeof(EvokerBuilder).GetMethod(
+            nameof(EvokerBuilder.GetFunc), 1, new[] { typeof(string), typeof(object[]) })!;
 
         public DynamicClass SetValue<T>(string propertyName, T value)
         {
