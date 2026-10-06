@@ -1,7 +1,10 @@
 ﻿using DSO.Core.Evoker;
+using DSO.Core.Evoker.Commands;
+using DSO.Core.Evoker.Description;
 using DSO.Core.Evoker.TestApi;
 using System.Reflection.Emit;
 using System.Text;
+using System.Text.Json;
 
 namespace DSO.Core.Evoker.TestApi
 {
@@ -1026,5 +1029,324 @@ namespace DSO.Core.Evoker.TestApi
 
     namespace Dup1 { public class AmbigName { } }
     namespace Dup2 { public class AmbigName { } }
+
+    // ---------------- Test hedefleri ----------------
+
+    public enum CmdLevel { Low = 1, Mid = 2, High = 3 }
+
+    public class CmdAddress { public string City { get; set; } = ""; public string? Street { get; set; } }
+
+    public class CmdCustomer
+    {
+        public string Code { get; set; } = "";
+        public string Name { get; set; } = "";
+        public CmdAddress? Address { get; set; }
+        public List<string> Tags { get; set; } = new();
+    }
+
+    public class CmdSaveResult { public int Id { get; set; } public string Code { get; set; } = ""; public string City { get; set; } = ""; public int TagCount { get; set; } }
+
+    public class CmdService
+    {
+        private int _secret = 7;
+        public int Counter;
+        public readonly int Fixed = 10;
+        public const string Version = "1.0";
+        public int BatchSize { get; set; } = 100;
+        public string ReadOnlyProp => "ro";
+        public CmdLevel Level { get; set; } = CmdLevel.Low;
+        public static string StaticNote = "not";
+
+        public int Add(int a, int b) => a + b;
+        public double Add(double a, double b) => a + b + 0.5;
+        public string Greet(string name, string greeting = "Merhaba") => $"{greeting}, {name}!";
+        public string Kind(object o) => "obj";
+        public string Kind(string s) => "str";
+        public string Combine(int a, int b) => (a * 10 + b).ToString();
+        public string Combine(string a, string b) => a + "+" + b;
+        public string Pick(long x) => "long";
+        public string Pick(decimal x) => "decimal";
+        public CmdSaveResult SaveCustomer(CmdCustomer c) => new() { Id = 42, Code = c.Code, City = c.Address?.City ?? "", TagCount = c.Tags.Count };
+        public async Task<int> AddAsync(int a, int b) { await Task.Delay(5); return a + b; }
+        public async Task TouchAsync(int v) { await Task.Delay(5); Counter = v; }
+        public ValueTask<int> TwiceAsync(int x) => new(x * 2);
+        public int Increment() => ++Counter;
+        public CmdLevel Next(CmdLevel l) => l == CmdLevel.High ? CmdLevel.High : l + 1;
+        public int Divide(int a, int b) => a / b;
+        public static int StaticTwice(int x) => x * 2;
+        private int Hidden(int x) => x + _secret;
+        public void Fail() => throw new InvalidOperationException("kasıtlı hata");
+        public DateTime When(DateTime d) => d.AddDays(1);
+        public Guid Echo(Guid g) => g;
+        public List<int> Range(int n) => Enumerable.Range(1, n).ToList();
+    }
+
+    public static class CmdKur
+    {
+        public static decimal Rate { get; set; } = 30m;
+        public static decimal Convert(decimal amount) => amount * Rate;
+    }
+
+    public class CmdWithCtor
+    {
+        public string Conn { get; }
+        public long Limit { get; }
+        public CmdLevel Level { get; }
+        public CmdWithCtor(string conn, long limit = 50, CmdLevel level = CmdLevel.Mid) { Conn = conn; Limit = limit; Level = level; }
+        public string Info() => $"{Conn}|{Limit}|{Level}";
+    }
+
+    public class CmdParams
+    {
+        public int Sum(params int[] xs) => xs.Sum();
+        public string Join(string sep, params string[] parts) => string.Join(sep, parts);
+    }
+
+    public class CmdCounter
+    {
+        private int _n;
+        public int Inc() => ++_n;
+    }
+
+    public static class CommandTests
+    {
+        private static int _fail;
+        private static void Check(string label, bool ok, string detail = "")
+        {
+            Console.WriteLine($"  [{(ok ? "OK" : "HATA")}]   {label}{(detail.Length > 0 ? " -> " + detail : "")}");
+            if (!ok) _fail++;
+        }
+
+        private static EvokerCommandResult Run(IEvokerTarget t, string json) => t.ExecuteAsync(EvokerCommand.Parse(json)).GetAwaiter().GetResult();
+        private static string J(object? o) => JsonSerializer.Serialize(o, EvokerCommandResult.Options);
+        private static string Err(EvokerCommandResult r) => r.Error == null ? "" : $"{r.Error.Code}: {r.Error.Message}";
+
+        public static void RunAll()
+        {
+            var svc = new EvokerTarget(typeof(CmdService));
+            var priv = new EvokerTarget(typeof(CmdService), includeNonPublic: true);
+
+            Console.WriteLine("=== TEST C1: invoke - sıralı / isimli / overload / dönüşümler ===");
+            var r = Run(svc, "{ \"op\": \"invoke\", \"member\": \"Add\", \"args\": [3, 4] }");
+            Check("sıralı argüman Add(3,4)=7 (tam sayı -> int overload)", r.Success && Equals(r.Result, 7), J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Add\", \"args\": [1.5, 2] }");
+            Check("ondalık -> double overload, op verilmezse invoke", r.Success && Equals(r.Result, 4.0), J(r.Result) + Err(r));
+            r = Run(svc, "{ \"op\": \"invoke\", \"member\": \"Greet\", \"args\": { \"name\": \"Ali\" } }");
+            Check("isimli argüman + optional varsayılanı", r.Success && (string?)r.Result == "Merhaba, Ali!", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"op\": \"invoke\", \"member\": \"greet\", \"args\": { \"GREETING\": \"Selam\", \"Name\": \"Ayşe\" } }");
+            Check("isimli argüman sırası ve büyük/küçük harf önemsiz (metot adı da)", r.Success && (string?)r.Result == "Selam, Ayşe!", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Kind\", \"args\": [\"a\"] }");
+            Check("overload: metin -> Kind(string)", r.Success && (string?)r.Result == "str", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Kind\", \"args\": [5] }");
+            Check("overload: sayı -> Kind(object)", r.Success && (string?)r.Result == "obj", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Combine\", \"args\": [\"a\", \"b\"] }");
+            Check("overload: Combine(string,string)", r.Success && (string?)r.Result == "a+b", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Pick\", \"args\": [5] }");
+            Check("overload: tam sayı -> long (decimal'den önce)", r.Success && (string?)r.Result == "long", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Pick\", \"args\": [5], \"argTypes\": [\"decimal\"] }");
+            Check("argTypes ipucu ile decimal overload", r.Success && (string?)r.Result == "decimal", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"SaveCustomer\", \"args\": { \"c\": { \"code\": \"C001\", \"name\": \"Acme\", \"address\": { \"city\": \"İstanbul\" }, \"tags\": [\"a\",\"b\"] } } }");
+            Check("nesne argüman (isimli, iç içe, liste, küçük harf alanlar)", r.Success && r.Result is CmdSaveResult { Id: 42, Code: "C001", City: "İstanbul", TagCount: 2 }, J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"SaveCustomer\", \"args\": { \"Code\": \"C002\", \"Address\": { \"City\": \"Ankara\" } } }");
+            Check("tek parametreli metoda nesnenin kendisi (parametre adı yazmadan)", r.Success && r.Result is CmdSaveResult { Code: "C002", City: "Ankara" }, J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Next\", \"args\": [\"mid\"] }");
+            Check("enum adı (küçük harf) -> enum, dönüş enum", r.Success && Equals(r.Result, CmdLevel.High), J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Next\", \"args\": [1] }");
+            Check("enum sayı ile", r.Success && Equals(r.Result, CmdLevel.Mid), J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"When\", \"args\": [\"2026-01-31T10:00:00\"] }");
+            Check("DateTime metinden", r.Success && r.Result is DateTime d && d.Day == 1 && d.Month == 2, J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Echo\", \"args\": [\"11111111-2222-3333-4444-555555555555\"] }");
+            Check("Guid metinden", r.Success && r.Result is Guid, J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"Range\", \"args\": [3] }");
+            Check("liste dönüşü", r.Success && J(r.Result) == "[1,2,3]", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"StaticTwice\", \"args\": [21] }");
+            Check("static metot (Singleton hedefte de)", r.Success && Equals(r.Result, 42), J(r.Result) + Err(r));
+
+            Console.WriteLine("=== TEST C2: async ===");
+            r = Run(svc, "{ \"member\": \"AddAsync\", \"args\": [10, 20] }");
+            Check("Task<int> beklenir", r.Success && Equals(r.Result, 30), J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"TouchAsync\", \"args\": [77] }");
+            Check("Task (void) beklenir, sonuç null", r.Success && r.Result == null, Err(r));
+            r = Run(svc, "{ \"op\": \"get\", \"member\": \"Counter\" }");
+            Check("TouchAsync beklenmişti -> Counter=77", r.Success && Equals(r.Result, 77), J(r.Result) + Err(r));
+            r = Run(svc, "{ \"member\": \"TwiceAsync\", \"args\": [21] }");
+            Check("ValueTask<int>", r.Success && Equals(r.Result, 42), J(r.Result) + Err(r));
+
+            Console.WriteLine("=== TEST C3: get / set ===");
+            r = Run(svc, "{ \"op\": \"set\", \"member\": \"BatchSize\", \"value\": 500 }");
+            var g = Run(svc, "{ \"op\": \"get\", \"member\": \"batchsize\" }");
+            Check("set + get property (küçük harf)", r.Success && g.Success && Equals(g.Result, 500), J(g.Result) + Err(r) + Err(g));
+            r = Run(svc, "{ \"op\": \"set\", \"member\": \"Level\", \"value\": \"High\" }");
+            g = Run(svc, "{ \"op\": \"get\", \"member\": \"Level\" }");
+            Check("enum property metinle", r.Success && Equals(g.Result, CmdLevel.High), J(g.Result) + Err(r));
+            r = Run(svc, "{ \"op\": \"set\", \"member\": \"BatchSize\", \"value\": \"250\" }");
+            g = Run(svc, "{ \"op\": \"get\", \"member\": \"BatchSize\" }");
+            Check("sayı metin olarak da yazılabilir (\"250\")", r.Success && Equals(g.Result, 250), J(g.Result) + Err(r));
+            r = Run(svc, "{ \"op\": \"get\", \"member\": \"Fixed\" }");
+            Check("readonly field okunur", r.Success && Equals(r.Result, 10), Err(r));
+            r = Run(svc, "{ \"op\": \"set\", \"member\": \"Fixed\", \"value\": 1 }");
+            Check("readonly field yazılamaz -> InvalidOperation", !r.Success && r.Error!.Code == EvokerErrorCodes.InvalidOperation, Err(r));
+            r = Run(svc, "{ \"op\": \"get\", \"member\": \"Version\" }");
+            Check("const okunur", r.Success && (string?)r.Result == "1.0", Err(r));
+            r = Run(svc, "{ \"op\": \"set\", \"member\": \"ReadOnlyProp\", \"value\": \"x\" }");
+            Check("set'i olmayan property -> InvalidOperation", !r.Success && r.Error!.Code == EvokerErrorCodes.InvalidOperation, Err(r));
+            r = Run(svc, "{ \"op\": \"get\", \"member\": \"StaticNote\" }");
+            Check("static field okunur", r.Success && (string?)r.Result == "not", Err(r));
+
+            Console.WriteLine("=== TEST C4: private üyeler ===");
+            r = Run(svc, "{ \"member\": \"Hidden\", \"args\": [1] }");
+            Check("varsayılan hedefte private metot görünmez -> MemberNotFound", !r.Success && r.Error!.Code == EvokerErrorCodes.MemberNotFound, Err(r));
+            r = Run(priv, "{ \"member\": \"Hidden\", \"args\": [1] }");
+            Check("includeNonPublic: private metot", r.Success && Equals(r.Result, 8), Err(r));
+            r = Run(priv, "{ \"op\": \"get\", \"member\": \"_secret\" }");
+            Check("includeNonPublic: private field", r.Success && Equals(r.Result, 7), Err(r));
+
+            Console.WriteLine("=== TEST C5: hatalar ===");
+            r = Run(svc, "{ \"member\": \"YokBoyle\" }");
+            Check("olmayan metot -> MemberNotFound + mevcut üyeler listesi", !r.Success && r.Error!.Code == EvokerErrorCodes.MemberNotFound && r.Error.Message.Contains("Greet"), Err(r));
+            r = Run(svc, "{ \"member\": \"Add\", \"args\": [\"x\", \"y\"] }");
+            Check("uymayan argüman -> InvalidArguments + imzalar", !r.Success && r.Error!.Code == EvokerErrorCodes.InvalidArguments && r.Error.Message.Contains("Add("), Err(r));
+            r = Run(svc, "{ \"member\": \"Fail\" }");
+            Check("hedef kod hatası -> TargetException + tip adı", !r.Success && r.Error!.Code == EvokerErrorCodes.TargetException && r.Error.ExceptionType == "System.InvalidOperationException" && r.Error.Message == "kasıtlı hata", Err(r));
+            r = Run(svc, "{ \"op\": \"uç\", \"member\": \"Add\" }");
+            Check("bilinmeyen op -> BadRequest", !r.Success && r.Error!.Code == EvokerErrorCodes.BadRequest, Err(r));
+            r = Run(svc, "{ \"op\": \"set\", \"member\": \"BatchSize\" }");
+            Check("set'te value yok -> BadRequest", !r.Success && r.Error!.Code == EvokerErrorCodes.BadRequest, Err(r));
+            var bad = new EvokerCatalog().ExecuteAsync(Guid.NewGuid(), "{ bozuk json").GetAwaiter().GetResult();
+            Check("bozuk JSON -> BadRequest (exception değil)", !bad.Success && bad.Error!.Code == EvokerErrorCodes.BadRequest, Err(bad));
+            r = svc.ExecuteAsync(new EvokerCommand { Member = "AddAsync", Args = JsonDocument.Parse("[1,2]").RootElement, TimeoutMs = 1 }).GetAwaiter().GetResult();
+            Check("timeout -> Timeout", !r.Success && r.Error!.Code == EvokerErrorCodes.Timeout, Err(r));
+            Check("HTTP eşlemesi", EvokerErrorCodes.HttpStatus("MemberNotFound") == 404 && EvokerErrorCodes.HttpStatus("InvalidArguments") == 422 && EvokerErrorCodes.HttpStatus("TargetException") == 500);
+
+            Console.WriteLine("=== TEST C6: çok adımlı + batch ===");
+            r = Run(new EvokerTarget(typeof(CmdService)), "{ \"steps\": [ { \"op\": \"set\", \"member\": \"BatchSize\", \"value\": 7 }, { \"op\": \"invoke\", \"member\": \"Add\", \"args\": [1, 2], \"as\": \"toplam\" }, { \"op\": \"get\", \"member\": \"BatchSize\" } ] }");
+            Check("3 adım, sırayla, sonuçlar ve etiket", r.Success && r.Steps!.Count == 3 && Equals(r.Steps[1].Result, 3) && r.Steps[1].As == "toplam" && Equals(r.Steps[2].Result, 7), J(r.Steps) + Err(r));
+            r = Run(svc, "{ \"steps\": [ { \"member\": \"Divide\", \"args\": [1, 0] }, { \"member\": \"Add\", \"args\": [1, 1] } ] }");
+            Check("hata: StopOnError (varsayılan) -> sonraki adım Skipped, StepIndex=0", !r.Success && r.Error!.StepIndex == 0 && r.Steps![1].Skipped == true, J(r.Steps));
+            r = Run(svc, "{ \"steps\": [ { \"member\": \"Divide\", \"args\": [1, 0] }, { \"member\": \"Add\", \"args\": [1, 1] } ], \"stopOnError\": false }");
+            Check("stopOnError=false -> sonraki adım çalışır", !r.Success && r.Steps![1].Success && Equals(r.Steps[1].Result, 2), J(r.Steps));
+            r = Run(svc, "{ \"op\": \"batch\", \"member\": \"Add\", \"argsList\": [[1, 1], [2, 2], { \"a\": 3, \"b\": 3 }] }");
+            Check("batch (sıralı ve isimli karışık)", r.Success && J(r.Result) == "[2,4,6]", J(r.Result) + Err(r));
+            r = Run(svc, "{ \"op\": \"batch\", \"member\": \"Divide\", \"argsList\": [[4, 2], [1, 0], [9, 3]] }");
+            Check("batch hata -> BatchIndex=1", !r.Success && r.Error!.BatchIndex == 1 && r.Error.ExceptionType == "System.DivideByZeroException", Err(r));
+
+            Console.WriteLine("=== TEST C7: nesne ömrü (DI gibi) ===");
+            var single = new EvokerTarget(typeof(CmdCounter), EvokerLifetime.Singleton);
+            Run(single, "{ \"member\": \"Inc\" }");
+            r = Run(single, "{ \"member\": \"Inc\" }");
+            Check("Singleton: komutlar arası durum korunur (2)", Equals(r.Result, 2), J(r.Result));
+            var scoped = new EvokerTarget(typeof(CmdCounter), EvokerLifetime.Scoped);
+            r = Run(scoped, "{ \"steps\": [ { \"member\": \"Inc\" }, { \"member\": \"Inc\" } ] }");
+            var r2 = Run(scoped, "{ \"member\": \"Inc\" }");
+            Check("Scoped: komut içinde aynı nesne (1,2), sonraki komut yeni (1)", Equals(r.Steps![1].Result, 2) && Equals(r2.Result, 1), J(r.Steps) + J(r2.Result));
+            var transient = new EvokerTarget(typeof(CmdCounter), EvokerLifetime.Transient);
+            r = Run(transient, "{ \"steps\": [ { \"member\": \"Inc\" }, { \"member\": \"Inc\" } ] }");
+            Check("Transient: her adım yeni nesne (1,1)", Equals(r.Steps![0].Result, 1) && Equals(r.Steps[1].Result, 1), J(r.Steps));
+            var stat = new EvokerTarget(typeof(CmdKur));
+            Check("static sınıf otomatik Static", stat.Lifetime == EvokerLifetime.Static);
+            r = Run(stat, "{ \"member\": \"Convert\", \"args\": [2] }");
+            Check("Static hedef: static metot", r.Success && Equals(r.Result, 60m), J(r.Result) + Err(r));
+            r = Run(new EvokerTarget(typeof(CmdCounter), EvokerLifetime.Static), "{ \"member\": \"Inc\" }");
+            Check("Static hedefte instance üyesi -> InvalidOperation", !r.Success && r.Error!.Code == EvokerErrorCodes.InvalidOperation, Err(r));
+            var inst = new CmdCounter();
+            var fixedT = EvokerTarget.ForInstance(inst);
+            Run(fixedT, "{ \"member\": \"Inc\" }");
+            Check("hazır nesne hedefi: aynı nesne", inst.Inc() == 2);
+
+            Console.WriteLine("=== TEST C8: constructor seçimi (parametresiz şartı yok) ===");
+            var ct = new EvokerTarget(typeof(CmdWithCtor)).WithConstructorJson(JsonDocument.Parse("{ \"conn\": \"Server=x\", \"level\": \"High\" }").RootElement);
+            r = Run(ct, "{ \"member\": \"Info\" }");
+            Check("JSON isimli constructor argümanı + optional varsayılan + enum adı", r.Success && (string?)r.Result == "Server=x|50|High", J(r.Result) + Err(r));
+            var ct2 = new EvokerTarget(typeof(CmdWithCtor), constructorArgs: new object?[] { "S", 7 });
+            r = Run(ct2, "{ \"member\": \"Info\" }");
+            Check("CLR argümanlar: int -> long dönüşümü, eksik optional varsayılan", r.Success && (string?)r.Result == "S|7|Mid", J(r.Result) + Err(r));
+            var b = new EvokerBuilder(typeof(CmdWithCtor)).SetConstructor("Q");
+            Check("EvokerBuilder.SetConstructor: tek argüman, kalanlar optional", b.Invoke<string>("Info") == "Q|50|Mid");
+            Check("EvokerBuilder.FindConstructor", new EvokerBuilder(typeof(CmdWithCtor)).FindConstructor(new object?[] { "x" }).GetParameters().Length == 3);
+            r = Run(new EvokerTarget(typeof(CmdWithCtor), EvokerLifetime.Scoped), "{ \"member\": \"Info\", \"constructorArgs\": [\"K\", 3] }");
+            Check("Scoped hedefte constructorArgs komutla", r.Success && (string?)r.Result == "K|3|Mid", J(r.Result) + Err(r));
+            r = Run(new EvokerTarget(typeof(CmdWithCtor)), "{ \"member\": \"Info\" }");
+            Check("constructor argümanı verilmemiş -> InvalidArguments (açık mesaj)", !r.Success && r.Error!.Code == EvokerErrorCodes.InvalidArguments, Err(r));
+
+            Console.WriteLine("=== TEST C9: katalog (Guid anahtar, izin listesi) ===");
+            var cat = new EvokerCatalog();
+            var k1 = cat.Register(typeof(CmdService), name: "Servis");
+            var k2 = cat.Register(typeof(CmdService)); // aynı tip, isimsiz -> ayrı kayıt
+            var k3 = cat.RegisterInstance(new CmdCounter(), name: "Servis");      // aynı isim - serbest (sadece açıklama)
+            Check("3 kayıt, farklı Guid'ler, isim tekrarı serbest", cat.Entries.Count == 3 && k1 != k2 && cat.Find(k2)!.Name == null);
+            r = cat.ExecuteAsync(k1, "{ \"member\": \"Add\", \"args\": [2, 2] }").GetAwaiter().GetResult();
+            Check("Guid ile çalıştır", r.Success && Equals(r.Result, 4), Err(r));
+            r = cat.ExecuteAsync(Guid.NewGuid(), "{ \"member\": \"Add\" }").GetAwaiter().GetResult();
+            Check("bilinmeyen Guid -> TargetNotFound", !r.Success && r.Error!.Code == EvokerErrorCodes.TargetNotFound, Err(r));
+            r = cat.ExecuteOnTypeAsync("DSO.Core.Evoker.TestApi.CmdService", EvokerCommand.Invoke("Add", 1, 2)).GetAwaiter().GetResult();
+            Check("izin listesi boş -> isimle erişim NotAllowed", !r.Success && r.Error!.Code == EvokerErrorCodes.NotAllowed, Err(r));
+            cat.AllowTypesFrom("DSO.Core.Evoker.TestApi");
+            r = cat.ExecuteOnTypeAsync("DSO.Core.Evoker.TestApi.CmdService", EvokerCommand.Invoke("Add", 1, 2)).GetAwaiter().GetResult();
+            Check("izin verilince isimle çalışır (EvokerCommand.Invoke kod içinden)", r.Success && Equals(r.Result, 3), Err(r));
+            r = cat.ExecuteOnTypeAsync("System.IO.File", EvokerCommand.Invoke("Exists", "x")).GetAwaiter().GetResult();
+            Check("izin dışı tip (System.IO.File) -> NotAllowed", !r.Success && r.Error!.Code == EvokerErrorCodes.NotAllowed, Err(r));
+            Check("ListAllowedTypes sadece izinli tipler", cat.ListAllowedTypes("Cmd").All(t => t.Namespace == "DSO.Core.Evoker.TestApi") && cat.ListAllowedTypes("CmdService").Count == 1);
+            Check("Unregister", cat.Unregister(k3) && cat.Entries.Count == 2);
+
+            Console.WriteLine("=== TEST C10: tanım + şablon (samples) + değerler ===");
+            var desc = svc.DescribeAsync(new EvokerDescribeOptions { IncludeSamples = true, IncludeValues = true }).GetAwaiter().GetResult();
+            var greet = desc.Methods!.First(m => m.Name == "Greet");
+            Check("imza metni", greet.Signature == "string Greet(string name, string greeting = \"Merhaba\")", greet.Signature ?? "");
+            Check("metot şablonu: isimli args, optional varsayılanı",
+                greet.Sample?.GetRawText() == "{\"op\":\"invoke\",\"member\":\"Greet\",\"args\":{\"name\":\"\",\"greeting\":\"Merhaba\"}}", greet.Sample?.GetRawText() ?? "");
+            var save = desc.Methods!.First(m => m.Name == "SaveCustomer");
+            Check("nesne parametresinin iskeleti (iç içe + liste)",
+                save.Sample?.GetRawText() == "{\"op\":\"invoke\",\"member\":\"SaveCustomer\",\"args\":{\"c\":{\"Code\":\"\",\"Name\":\"\",\"Address\":{\"City\":\"\",\"Street\":\"\"},\"Tags\":[\"\"]}}}", save.Sample?.GetRawText() ?? "");
+            var lvl = desc.Properties!.First(p => p.Name == "Level");
+            Check("property get/set şablonu (enum ilk değer adı)", lvl.Sample != null && lvl.SampleSet?.GetRawText() == "{\"op\":\"set\",\"member\":\"Level\",\"value\":\"Low\"}", lvl.SampleSet?.GetRawText() ?? "");
+            var bs = desc.Properties!.First(p => p.Name == "BatchSize");
+            Check("değerler: Singleton nesnenin o anki değeri (250)", bs.Value?.GetRawText() == "250", bs.Value?.GetRawText() ?? bs.ValueError ?? "");
+            var ctorD = new EvokerTarget(typeof(CmdWithCtor)).DescribeAsync(new EvokerDescribeOptions { IncludeSamples = true }).GetAwaiter().GetResult();
+            Check("constructor şablonu (kayıt formu için)", ctorD.Constructors![0].Sample?.GetRawText() == "{\"conn\":\"\",\"limit\":50,\"level\":\"Mid\"}", ctorD.Constructors[0].Sample?.GetRawText() ?? "");
+            var sd = stat.DescribeAsync(new EvokerDescribeOptions { IncludeValues = true }).GetAwaiter().GetResult();
+            Check("static sınıf tanımı + static değer", sd.Kind == EvokerTypeKind.StaticClass && sd.Properties!.First(p => p.Name == "Rate").Value?.GetRawText() == "30", sd.Properties!.First(p => p.Name == "Rate").Value?.GetRawText() ?? "");
+
+            Console.WriteLine("=== TEST C11: sonuç JSON'u (web) ===");
+            r = Run(svc, "{ \"member\": \"SaveCustomer\", \"args\": [{ \"Code\": \"Ç1\", \"Address\": { \"City\": \"İzmir\" } }] }");
+            var json = r.ToJson();
+            Check("camelCase zarf, Türkçe karakter kaçışsız, null alan yok",
+                json.Contains("\"success\":true") && json.Contains("\"result\":{") && json.Contains("Ç1") && json.Contains("İzmir") && !json.Contains("\"error\""), json);
+            var back = EvokerCommandResult.FromJson(json);
+            Check("JSON'dan geri okunur (process sınırı için)", back.Success && back.Result is JsonElement je && je.GetProperty("code").GetString() == "Ç1", J(back.Result));
+            var cmdJson = EvokerCommand.Multi(EvokerCommand.Set("BatchSize", null), EvokerCommand.Invoke("Add", 1, 2)).ToJson();
+            var reparsed = EvokerCommand.Parse(cmdJson);
+            Check("komut JSON'a yazılıp geri okunur; set'te açık null korunur", reparsed.Steps!.Count == 2 && reparsed.Steps[0].Value.ValueKind == JsonValueKind.Null && reparsed.Steps[1].Args.GetArrayLength() == 2, cmdJson);
+
+            Console.WriteLine("=== TEST C12: params / ParamArray ===");
+            var pr = new EvokerTarget(typeof(CmdParams));
+            r = Run(pr, "{ \"member\": \"Sum\", \"args\": [1, 2, 3] }");
+            Check("params: argümanlar tek tek", r.Success && Equals(r.Result, 6), J(r.Result) + Err(r));
+            r = Run(pr, "{ \"member\": \"Sum\", \"args\": [[4, 5]] }");
+            Check("params: dizi olarak", r.Success && Equals(r.Result, 9), J(r.Result) + Err(r));
+            r = Run(pr, "{ \"member\": \"Sum\" }");
+            Check("params: hiç verilmezse boş dizi", r.Success && Equals(r.Result, 0), J(r.Result) + Err(r));
+            r = Run(pr, "{ \"member\": \"Join\", \"args\": [\"-\", \"a\", \"b\", \"c\"] }");
+            Check("params: sabit parametre + tek tek", r.Success && (string?)r.Result == "a-b-c", J(r.Result) + Err(r));
+            r = Run(pr, "{ \"member\": \"Join\", \"args\": { \"sep\": \"+\", \"parts\": [\"x\", \"y\"] } }");
+            Check("params: isimli (dizi)", r.Success && (string?)r.Result == "x+y", J(r.Result) + Err(r));
+            r = Run(pr, "{ \"member\": \"Sum\", \"args\": [1, \"iki\"] }");
+            Check("params: uymayan eleman -> InvalidArguments", !r.Success && r.Error!.Code == EvokerErrorCodes.InvalidArguments, Err(r));
+
+            Console.WriteLine("=== TEST C13: sayısal overload tercihi (System.Math) ===");
+            var math = new EvokerTarget(typeof(Math));
+            r = Run(math, "{ \"member\": \"Max\", \"args\": [3, 7] }");
+            Check("Math.Max(3,7) -> int overload (8 tam sayı overload'u arasından)", r.Success && r.Result is int and 7, J(r.Result) + Err(r));
+            r = Run(math, "{ \"member\": \"Max\", \"args\": [1.5, 2] }");
+            Check("Math.Max(1.5,2) -> double", r.Success && r.Result is double and 2.0, J(r.Result) + Err(r));
+            r = Run(math, "{ \"member\": \"Max\", \"args\": [5000000000, 1] }");
+            Check("int'e sığmayan değer -> long", r.Success && r.Result is long and 5000000000L, J(r.Result) + Err(r));
+            r = Run(math, "{ \"member\": \"Max\", \"args\": [3, 7], \"argTypes\": [\"byte\", \"byte\"] }");
+            Check("argTypes ile byte", r.Success && r.Result is byte, J(r.Result) + Err(r));
+            r = Run(math, "{ \"member\": \"Abs\", \"args\": [-4] }");
+            Check("Math.Abs(-4) -> int", r.Success && r.Result is int and 4, J(r.Result) + Err(r));
+
+            Console.WriteLine(_fail == 0 ? "\nTÜM KOMUT TESTLERİ GEÇTİ ✅" : $"\n{_fail} KOMUT TESTİ BAŞARISIZ ❌");
+            if (_fail > 0) Environment.ExitCode = 1;
+        }
+    }
 }
- 

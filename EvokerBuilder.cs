@@ -396,7 +396,7 @@ namespace DSO.Core.Evoker
             return methods;
         }
 
-        private static List<MethodInfo> CandidatesFor(List<MethodInfo> methods, int n)
+        private static List<T> CandidatesFor<T>(List<T> methods, int n) where T : MethodBase
         {
             var exact = methods.Where(m => m.GetParameters().Length == n).ToList();
             return exact.Count > 0
@@ -405,7 +405,10 @@ namespace DSO.Core.Evoker
         }
 
         /// <summary>Metot n argümanla çağrılabilir mi: n &lt;= parametre sayısı ve n'den sonraki parametrelerin hepsi optional.</summary>
-        public static bool AcceptsArgCount(MethodInfo method, int n)
+        public static bool AcceptsArgCount(MethodInfo method, int n) => AcceptsArgCount((MethodBase)method, n);
+
+        /// <summary>Metot ya da constructor n argümanla çağrılabilir mi (bkz. AcceptsArgCount(MethodInfo, int)).</summary>
+        public static bool AcceptsArgCount(MethodBase method, int n)
         {
             var ps = method.GetParameters();
             if (n > ps.Length) return false;
@@ -414,7 +417,7 @@ namespace DSO.Core.Evoker
             return true;
         }
 
-        private static bool MatchesArgTypes(MethodInfo method, Type?[] argTypes, bool exact)
+        private static bool MatchesArgTypes(MethodBase method, Type?[] argTypes, bool exact)
         {
             var parameters = method.GetParameters();
             // Sadece VERİLEN argümanlar karşılaştırılır - geri kalan parametreler optional (varsayılanla dolacak).
@@ -516,23 +519,106 @@ namespace DSO.Core.Evoker
                 return _existingInstance;
 
             if (_constructorArgs != null && _constructorArgs.Length > 0)
-            {
-                var ctorTypes = _constructorArgs.Select(x => x.GetType()).ToArray();
-                var ctor = _type.GetConstructor(ctorTypes)
-                    ?? throw new MissingMethodException(
-                        $"[EvokerEngine] '{_type.Name}' için uyumlu constructor bulunamadı (Args: {string.Join(", ", ctorTypes.Select(t => t.Name))}).");
-                return ctor.Invoke(_constructorArgs);
-            }
+                return GetConstructorInvoker(_constructorArgs)(_constructorArgs);
 
             try
             {
-                return DynamicEntityAccessor.GetConstructor(_type)();
+                return DynamicEntityAccessor.GetConstructor(_type, _includeNonPublic)();
             }
             catch (MissingMethodException)
             {
-                throw new MissingMethodException(
-                    $"[EvokerEngine] '{_type.Name}' türünün parametresiz constructor'ı yok. SetInstance() veya SetConstructor() kullanın.");
+                // Parametresiz constructor yok - ama TÜM parametreleri optional olan bir constructor varsa o kullanılır.
+                var empty = Array.Empty<object>();
+                try { return GetConstructorInvoker(empty)(empty); }
+                catch (MissingMethodException)
+                {
+                    throw new MissingMethodException(
+                        $"[EvokerEngine] '{_type.Name}' türünün parametresiz (ya da tüm parametreleri optional) constructor'ı yok. " +
+                        "SetInstance() veya SetConstructor(args) kullanın.");
+                }
             }
+        }
+
+        /// <summary>
+        /// Builder'ın kurallarıyla bir nesne verir: SetInstance verildiyse o nesne; değilse YENİ bir nesne
+        /// (SetConstructor argümanlarıyla - bkz. FindConstructor - ya da parametresiz / tüm parametreleri optional constructor ile).
+        /// </summary>
+        public object CreateInstance() => ResolveInstance()!;
+
+        // --- Constructor seçimi (metot seçimiyle AYNI kural) ---
+
+        /// <summary>
+        /// Verilen argümanlarla çağrılacak constructor - FindMethod ile AYNI kurallar: önce parametre sayısı birebir
+        /// olanlar, yoksa fazlası optional olanlar (eksikler varsayılanla dolar); birden fazla aday varsa argüman
+        /// tiplerine göre (önce birebir, sonra atanabilir). IncludeNonPublic ise private/protected constructor'lar da.
+        /// Eskiden SetConstructor sadece argüman tipleriyle BİREBİR eşleşen public constructor'ı buluyordu (ör. int
+        /// parametreli constructor'a long veremez, optional parametreli constructor'ı eksik argümanla çağıramazdınız).
+        /// </summary>
+        public ConstructorInfo FindConstructor(object?[] args)
+        {
+            if (args == null) throw new ArgumentNullException(nameof(args));
+            var types = new Type?[args.Length];
+            for (int i = 0; i < types.Length; i++) types[i] = args[i]?.GetType();
+            return FindConstructorByTypes(types);
+        }
+
+        /// <summary>FindConstructor ile aynı kural; argüman değerleri yerine TİPLERİ (null eleman = null argüman).</summary>
+        public ConstructorInfo FindConstructorByTypes(Type?[] argTypes)
+        {
+            if (argTypes == null) throw new ArgumentNullException(nameof(argTypes));
+            var ctors = Constructors();
+            if (ctors.Count == 0)
+                throw new MissingMethodException($"[EvokerEngine] '{_type.Name}' türünün{(_includeNonPublic ? "" : " public")} constructor'ı yok" +
+                    (_type.IsAbstract && _type.IsSealed ? " (static sınıf - instance oluşturulamaz; sadece static üyeleri çağrılabilir)." : "."));
+
+            var candidates = CandidatesFor(ctors, argTypes.Length);
+            if (candidates.Count == 0)
+                throw new MissingMethodException(
+                    $"[EvokerEngine] '{_type.Name}' için {argTypes.Length} argümanla çağrılabilen bir constructor yok. Mevcut: " +
+                    string.Join("; ", ctors.Select(c => $"({string.Join(", ", c.GetParameters().Select(p => (p.IsOptional ? "[opt] " : "") + p.ParameterType.Name))})")));
+            if (candidates.Count == 1) return candidates[0];
+            return candidates.FirstOrDefault(c => MatchesArgTypes(c, argTypes, exact: true))
+                ?? candidates.FirstOrDefault(c => MatchesArgTypes(c, argTypes, exact: false))
+                ?? candidates[0];
+        }
+
+        /// <summary>Tipin (IncludeNonPublic'e göre görülebilen) instance constructor'ları.</summary>
+        public IReadOnlyList<ConstructorInfo> GetConstructors() => Constructors();
+
+        private List<ConstructorInfo> Constructors() =>
+            _type.GetConstructors(BindingFlags.Instance | BindingFlags.Public | (_includeNonPublic ? BindingFlags.NonPublic : 0)).ToList();
+
+        private Func<object[], object> GetConstructorInvoker(object[] args)
+        {
+            var key = new CacheKey(_type, ".ctor", "Ctor", _type, ArgTypeKey.From(args), _includeNonPublic);
+            var cm = Cache.GetOrAdd(key, static (k, st) => st.Self.BuildConstructorInvoker(st.Args), (Self: this, Args: args));
+            return (Func<object[], object>)cm.Invoker;
+        }
+
+        private CachedMethod BuildConstructorInvoker(object[] sampleArgs)
+        {
+            var ctor = FindConstructor(sampleArgs);
+            var argsParam = Expression.Parameter(typeof(object[]), "args");
+            var ps = ctor.GetParameters();
+            var converted = new Expression[ps.Length];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (ps[i].ParameterType.IsByRef)
+                    throw new NotSupportedException($"[EvokerBuilder] '{_type.Name}' constructor'ının '{ps[i].Name}' parametresi ref/out - desteklenmez.");
+                if (i >= sampleArgs.Length) { converted[i] = DefaultValueExpression(ps[i]); continue; }
+                Expression item = Expression.ArrayIndex(argsParam, Expression.Constant(i));
+                // Argüman tipi parametreye doğrudan uymuyorsa (ör. int -> long, string -> enum) dönüştürücüden geçir -
+                // aksi halde object'ten unbox "Specified cast is not valid" verirdi. Karar argüman TİPLERİNE bağlı ve
+                // cache anahtarı da tiplerden oluştuğu için aynı imzalı sonraki çağrılarda da geçerli.
+                var a = sampleArgs[i];
+                if (a != null && !ps[i].ParameterType.IsInstanceOfType(a))
+                    item = Expression.Call(typeof(Conversion.EvokerValueConverter).GetMethod(nameof(Conversion.EvokerValueConverter.ConvertTo))!,
+                        item, Expression.Constant(ps[i].ParameterType, typeof(Type)));
+                converted[i] = Expression.Convert(item, ps[i].ParameterType);
+            }
+            Expression body = Expression.New(ctor, converted);
+            if (_type.IsValueType) body = Expression.Convert(body, typeof(object));
+            return new CachedMethod(Expression.Lambda<Func<object[], object>>(body, argsParam).Compile(), isStatic: false);
         }
 
         private sealed class CachedMethod
@@ -560,6 +646,7 @@ namespace DSO.Core.Evoker
             foreach (var key in Cache.Keys)
                 if (key.Type == type || Involves(key.ReturnType, type) || key.Args.Involves(t => Involves(t, type)))
                     Cache.TryRemove(key, out _);
+            Commands.EvokerMemberCache.ForgetType(type); // komut çalıştırıcının derlenmiş erişimcileri
         }
 
         // t, target'ın kendisi ya da onu (dizi elemanı / generic argüman olarak - ör. List<Point>, Task<Point>) içeriyor mu.

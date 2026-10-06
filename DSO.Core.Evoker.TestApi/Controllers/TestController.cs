@@ -124,5 +124,11 @@ namespace DSO.Core.Evoker.TestApi.Controllers
         {
             BuilderFeatureTests.RunAll();
         }
+
+        [HttpGet("Test11CommandTests")]
+        public void Test11CommandTests()
+        {
+            CommandTests.RunAll();
+        }
     }
 }
