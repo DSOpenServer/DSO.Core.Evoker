@@ -42,11 +42,11 @@ Bir kural motoru, ORM materyalizasyonu, plugin sistemi, dinamik form/rapor üret
 | Paket | Ne yapar |
 |---|---|
 | **DSO.Core.Evoker** (bu paket) | Çağırma, tip üretimi, boxing'siz erişim, JSON komutlar, katalog, tip tanımı |
-| [DSO.Core.Evoker.Extend](../DSO.Core.Evoker.Extend/README.md) | Üretilen tiplere **interface / base class** implementasyonu, generic metot, `ref`/`out`, event, indexer |
-| [DSO.Core.Evoker.Json](../DSO.Core.Evoker.Json/README.md) | Üretilen tipleri `System.Text.Json` ile tek satırda serialize / deserialize |
-| [DSO.Core.Evoker.Api](../DSO.Core.Evoker.Api/README.md) | Katalogdaki her hedefi **ASP.NET Core** uçlarından JSON komutla kullanma |
-| [DSO.Core.Evoker.Plugins](../DSO.Core.Evoker.Plugins/README.md) | DLL plugin'leri **ayrı process'te (sandbox)** ya da **unload edilebilir context'te** çalıştırma, canlı mod geçişi |
-| [DSO.Core.Evoker.Plugins.Api](../DSO.Core.Evoker.Plugins.Api/README.md) | Plugin yönetimini (tarama, kayıt, aktif/pasif, komut) hazır REST uçları olarak sunma |
+| [DSO.Core.Evoker.Extend](https://github.com/DSOpenServer/DSO.Core.Evoker.Extend/blob/main/README.md) | Üretilen tiplere **interface / base class** implementasyonu, generic metot, `ref`/`out`, event, indexer |
+| [DSO.Core.Evoker.Json](https://github.com/DSOpenServer/DSO.Core.Evoker.Json/blob/main/README.md) | Üretilen tipleri `System.Text.Json` ile tek satırda serialize / deserialize |
+| [DSO.Core.Evoker.Api](https://github.com/DSOpenServer/DSO.Core.Evoker.Api/blob/main/README.md) | Katalogdaki her hedefi **ASP.NET Core** uçlarından JSON komutla kullanma |
+| [DSO.Core.Evoker.Plugins](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins/blob/main/README.md) | DLL plugin'leri **ayrı process'te (sandbox)** ya da **unload edilebilir context'te** çalıştırma, canlı mod geçişi |
+| [DSO.Core.Evoker.Plugins.Api](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins.Api/blob/main/README.md) | Plugin yönetimini (tarama, kayıt, aktif/pasif, komut) hazır REST uçları olarak sunma |
 
 ---
 
@@ -69,7 +69,7 @@ Bunların üstüne, sıradan kütüphanelerin genelde hiç düşünmediği şeyl
 - **Akıllı overload seçimi.** Önce birebir ad, sonra büyük/küçük harf duyarsız ad (VB.NET dostu). Sonra argüman sayısı,
   optional parametreler, tip uyumu. JSON komutlarda ise ek olarak sayısal tercih (int → long → …) ve `params` desteği var.
 - **Unload dostu.** Her cache'in bir "unut" kapısı var (`ForgetType`, `ForgetAssembly`). Collectible AssemblyLoadContext'ler
-  gerçekten bellekten atılabilir; bu, [Plugins](../DSO.Core.Evoker.Plugins/README.md) paketinde testle doğrulanmıştır.
+  gerçekten bellekten atılabilir; bu, [Plugins](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins/blob/main/README.md) paketinde testle doğrulanmıştır.
 - **JSON-native.** Herhangi bir sınıf, hiçbir değişiklik yapmadan `{ "op":"invoke", "member":"Kes", "args":{...} }`
   komutlarıyla kullanılabilir. Tanım (describe) ve hazır komut şablonları da otomatik üretilir.
 
