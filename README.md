@@ -341,7 +341,7 @@ int adet = EvokerBuilder.CachedCountFor(typeof(PluginTipi));
 
 > **`ref` / `out`:** `object[]` sözleşmesi bu değerleri çağırana geri taşıyamadığı için `ref`/`out` parametreli metotlar
 > açık bir `NotSupportedException` ile reddedilir; değerler sessizce kaybolmaz. Bu tür metotlar için
-> [DSO.Core.Evoker.Extend](../DSO.Core.Evoker.Extend/README.md) ya da düz reflection kullanın.
+> [DSO.Core.Evoker.Extend](https://github.com/DSOpenServer/DSO.Core.Evoker.Extend/blob/main/README.md) ya da düz reflection kullanın.
 
 ---
 
@@ -401,7 +401,7 @@ DynamicTypeFactory.ForgetSchema("Musteri", props);               // şemayı cac
 DynamicTypeFactory.MaxSchemaCacheSize = 5000;                     // FIFO üst sınır
 ```
 
-**Genişletme parametreleri** (çekirdek bunlara ihtiyaç duymaz; [Extend](../DSO.Core.Evoker.Extend/README.md) kullanır):
+**Genişletme parametreleri** (çekirdek bunlara ihtiyaç duymaz; [Extend](https://github.com/DSOpenServer/DSO.Core.Evoker.Extend/blob/main/README.md) kullanır):
 
 ```csharp
 Type t = DynamicTypeFactory.CreateType(
@@ -498,7 +498,7 @@ dc.RaiseEvent("Degisti", dc.RawInstance, EventArgs.Empty);
 ```
 
 Gerçek C# `+=` söz dizimiyle abone olmak için tipi bir interface'e bağlayın:
-[Extend → `Implement<T>`](../DSO.Core.Evoker.Extend/README.md).
+[Extend → `Implement<T>`](https://github.com/DSOpenServer/DSO.Core.Evoker.Extend/blob/main/README.md).
 
 #### Attribute ekleme
 
@@ -530,8 +530,8 @@ dc.Dispose();        // forgetOnDispose: true ise cache'leri de temizler
 hale getirir. Aynı komut biçimi her yerde çalışır:
 
 - bir tipte (`EvokerTarget`),
-- bir plugin'de ([`PluginTarget`](../DSO.Core.Evoker.Plugins/README.md), sandbox worker'ın içinde bile),
-- web üzerinden ([DSO.Core.Evoker.Api](../DSO.Core.Evoker.Api/README.md)).
+- bir plugin'de ([`PluginTarget`](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins/blob/main/README.md), sandbox worker'ın içinde bile),
+- web üzerinden ([DSO.Core.Evoker.Api](https://github.com/DSOpenServer/DSO.Core.Evoker.Api/blob/main/README.md)).
 
 #### Komut biçimi
 
@@ -762,7 +762,7 @@ bellekten atılamaz. Evoker'daki her cache'in bu yüzden bir çıkış kapısı 
 | Tip adı cache'i | Collectible tipler zaten zayıf referanslı; context unload olunca kendiliğinden silinir |
 | JSON / şekil eşleme | `EvokerJson.ForgetAssembly(asm)`, `EvokerValueConverter.ForgetAssembly(asm)` |
 
-[DSO.Core.Evoker.Plugins](../DSO.Core.Evoker.Plugins/README.md) bunların hepsini unload sırasında kendisi çağırır.
+[DSO.Core.Evoker.Plugins](https://github.com/DSOpenServer/DSO.Core.Evoker.Plugins/blob/main/README.md) bunların hepsini unload sırasında kendisi çağırır.
 `UnloadTest` paketi, in-process bir plugin'in Evoker ile defalarca kullanıldıktan sonra **gerçekten** bellekten
 atıldığını doğrular.
 
